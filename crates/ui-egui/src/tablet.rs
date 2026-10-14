@@ -281,7 +281,10 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
         });
     });
     egui::Panel::bottom("tablet-command").frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(6, 0))).show(ui, |ui| {
+        let height = if app.tablet_prefs.compact { 28.0 } else { 32.0 };
+        ui.spacing_mut().interact_size.y = height;
         ui.spacing_mut().button_padding.x *= 0.5;
+        ui.spacing_mut().button_padding.y *= 0.5;
         let prompt = app.session.current_prompt();
         let mut controls = button_width(ui, "Enter") + button_width(ui, "Cancel") + 2.0 * ui.spacing().item_spacing.x;
         if cfg!(target_os = "android") {
@@ -300,7 +303,7 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                     let hint = prompt.as_ref().map_or("Command", |p| p.message.as_str());
                     let response = ui
                         .add_sized(
-                            vec2(width, app.tablet_prefs.height()),
+                            vec2(width, height),
                             egui::TextEdit::singleline(&mut app.cmd.buffer)
                                 .hint_text(crate::i18n::t(hint))
                                 .font(crate::theme::mono())
