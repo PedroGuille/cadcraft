@@ -52,6 +52,14 @@ pub enum FileAction {
 }
 
 pub(crate) fn route(app: &mut CadApp, id: &str, params: &serde_json::Value) -> Option<Result<serde_json::Value, String>> {
+    if id == "ui.tablet.pan" && app.tablet_mode {
+        let active = params.get("on").and_then(serde_json::Value::as_bool).unwrap_or(!app.canvas.tablet_pan);
+        app.canvas.set_tablet_pan(active);
+        if active {
+            app.session.pending_window = None;
+        }
+        return Some(Ok(json!({"on": active})));
+    }
     if id.starts_with("ui.tablet.") && (!app.tablet_mode || !params.is_null()) {
         return Some(Err("This command requires the tablet host and an interactive invocation".into()));
     }
@@ -157,7 +165,23 @@ impl Taps {
 }
 
 fn button(ui: &mut egui::Ui, text: &str) -> bool {
-    ui.add(Button::new(crate::i18n::t(text)).min_size(vec2(36.0, ui.spacing().interact_size.y))).clicked()
+    let response = ui.add(Button::new(crate::i18n::t(text)).min_size(vec2(36.0, ui.spacing().interact_size.y)));
+    crate::control::record_widget(ui, &response, text, "button", None);
+    response.clicked()
+}
+
+fn toggle(ui: &mut egui::Ui, app: &mut CadApp, name: &str, var: &str, value: bool) {
+    let response = ui.add(Button::new(crate::i18n::t(name)).selected(value).min_size(vec2(36.0, ui.spacing().interact_size.y)));
+    crate::control::record_widget(ui, &response, name, "button", Some(value));
+    if response.clicked() {
+        let _ = app.run("setvar", json!({"name": var, "value": i32::from(!value)}));
+    }
+}
+
+fn button_width(ui: &egui::Ui, text: &str) -> f32 {
+    let font = egui::TextStyle::Button.resolve(ui.style());
+    let width = ui.fonts_mut(|fonts| fonts.layout_no_wrap(crate::i18n::t(text).into(), font, egui::Color32::PLACEHOLDER).size().x);
+    (width + 2.0 * ui.spacing().button_padding.x).max(36.0)
 }
 
 pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
@@ -179,7 +203,10 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
             });
     }
     let t = Tokens::get();
-    egui::Panel::top("tablet-tools").frame(egui::Frame::NONE.fill(t.chrome).inner_margin(6.0)).show(ui, |ui| {
+    egui::Panel::top("tablet-tools").frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(6, 0))).show(ui, |ui| {
+        let height = if app.tablet_prefs.compact { 28.0 } else { 32.0 };
+        ui.spacing_mut().interact_size.y = height;
+        ui.spacing_mut().button_padding.y = 0.0;
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.menu_button(crate::i18n::t("More"), |ui| {
                 for (label, command) in [
@@ -202,96 +229,106 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                     }
                 }
             });
-            egui::ScrollArea::horizontal().id_salt("tablet-tool-scroll").auto_shrink([false, true]).show(ui, |ui| {
+            egui::ScrollArea::horizontal()
+                .id_salt("tablet-tool-scroll")
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        for (icon, command, label) in [
+                            (Icon::New, "new", "New Drawing"),
+                            (Icon::Open, "ui.open", "Open"),
+                            (Icon::Save, "qsave", "Save"),
+                            (Icon::Undo, "u", "Undo"),
+                            (Icon::Redo, "redo", "Redo"),
+                            (Icon::ZoomExtents, "zoom.extents", "Zoom Extents"),
+                        ] {
+                            if icons::button(ui, icon, height, label, false).clicked() {
+                                app.start(command);
+                            }
+                        }
+                        ui.separator();
+                        for (label, command) in [
+                            ("Line", "line"),
+                            ("Polyline", "pline"),
+                            ("Circle", "circle"),
+                            ("Rectangle", "rectang"),
+                            ("Move", "move"),
+                            ("Offset", "offset"),
+                            ("Trim", "trim"),
+                            ("Measure", "dist"),
+                            ("Properties", "ui.toggle.palettes"),
+                            ("Layers", "ui.dialog.layers"),
+                            ("Export PDF", "exportpdf"),
+                        ] {
+                            if button(ui, label) {
+                                app.start(command);
+                            }
+                        }
+                        if icons::button(ui, Icon::Pan, height, "Pan", app.canvas.tablet_pan).clicked() {
+                            app.start("ui.tablet.pan");
+                        }
+                    });
+                });
+        });
+    });
+    egui::Panel::bottom("tablet-command").frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(6, 0))).show(ui, |ui| {
+        let prompt = app.session.current_prompt();
+        let mut controls = button_width(ui, "Enter") + button_width(ui, "Cancel") + 2.0 * ui.spacing().item_spacing.x;
+        if cfg!(target_os = "android") {
+            controls += button_width(ui, "Keyboard") + ui.spacing().item_spacing.x;
+        }
+        let width = ((ui.available_width() - controls).max(80.0) * 0.3).max(80.0);
+        egui::ScrollArea::horizontal()
+            .id_salt("tablet-command-scroll")
+            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    for (icon, command, label) in [
-                        (Icon::New, "new", "New Drawing"),
-                        (Icon::Open, "ui.open", "Open"),
-                        (Icon::Save, "qsave", "Save"),
-                        (Icon::Undo, "u", "Undo"),
-                        (Icon::Redo, "redo", "Redo"),
-                        (Icon::ZoomExtents, "zoom.extents", "Zoom Extents"),
-                    ] {
-                        if icons::button(ui, icon, app.tablet_prefs.height(), label, false).clicked() {
-                            app.start(command);
+                    ui.label("CADCraft");
+                    toggle(ui, app, "Grid", "GRIDMODE", app.session.settings.gridmode);
+                    toggle(ui, app, "Snap", "SNAPMODE", app.session.settings.snapmode);
+                    let hint = prompt.as_ref().map_or("Command", |p| p.message.as_str());
+                    let response = ui
+                        .add_sized(
+                            vec2(width, app.tablet_prefs.height()),
+                            egui::TextEdit::singleline(&mut app.cmd.buffer).hint_text(crate::i18n::t(hint)).font(crate::theme::mono()),
+                        )
+                        .on_hover_text(crate::i18n::t(hint));
+                    crate::control::record_widget(ui, &response, "Command", "textbox", None);
+                    let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let keyboard = cfg!(target_os = "android") && button(ui, "Keyboard");
+                    let enter = button(ui, "Enter");
+                    let cancel = button(ui, "Cancel");
+                    toggle(ui, app, "Ortho", "ORTHOMODE", app.session.settings.orthomode);
+                    if keyboard {
+                        app.tablet_keyboard_requested = true;
+                        response.surrender_focus();
+                    }
+                    if enter || submit {
+                        let text = std::mem::take(&mut app.cmd.buffer);
+                        let _ = app.cmdline(&text);
+                        response.surrender_focus();
+                    }
+                    if cancel {
+                        app.canvas.set_tablet_pan(false);
+                        app.session.cancel();
+                        app.cmd.buffer.clear();
+                        response.surrender_focus();
+                    }
+                    if let Some(prompt) = &prompt {
+                        for keyword in &prompt.keywords {
+                            if button(ui, keyword)
+                                && let Err(error) = app.session.input(cadcraft_engine::Input::Keyword(keyword.clone()))
+                            {
+                                app.set_status(error.to_string());
+                            }
                         }
                     }
-                    ui.separator();
-                    for (label, command) in [
-                        ("Line", "line"),
-                        ("Polyline", "pline"),
-                        ("Circle", "circle"),
-                        ("Rectangle", "rectang"),
-                        ("Move", "move"),
-                        ("Offset", "offset"),
-                        ("Trim", "trim"),
-                        ("Measure", "dist"),
-                        ("Properties", "ui.toggle.palettes"),
-                        ("Layers", "ui.dialog.layers"),
-                        ("Export PDF", "exportpdf"),
-                    ] {
-                        if button(ui, label) {
-                            app.start(command);
-                        }
+                    if let Some((status, _)) = &app.status {
+                        ui.add(egui::Label::new(status).truncate()).on_hover_text(status);
                     }
                 });
             });
-        });
-    });
-    egui::Panel::bottom("tablet-command").frame(egui::Frame::NONE.fill(t.chrome).inner_margin(6.0)).show(ui, |ui| {
-        let prompt = app.session.current_prompt();
-        ui.horizontal_wrapped(|ui| {
-            if let Some(prompt) = &prompt {
-                ui.label(crate::i18n::t(&prompt.message));
-                for keyword in &prompt.keywords {
-                    if button(ui, keyword)
-                        && let Err(error) = app.session.input(cadcraft_engine::Input::Keyword(keyword.clone()))
-                    {
-                        app.set_status(error.to_string());
-                    }
-                }
-            } else {
-                ui.label("CADCraft");
-                for (name, value) in
-                    [("Grid", app.session.settings.gridmode), ("Snap", app.session.settings.snapmode), ("Ortho", app.session.settings.orthomode)]
-                {
-                    if ui.add(Button::new(crate::i18n::t(name)).selected(value).min_size(vec2(36.0, app.tablet_prefs.height()))).clicked() {
-                        let var = match name {
-                            "Grid" => "GRIDMODE",
-                            "Snap" => "SNAPMODE",
-                            _ => "ORTHOMODE",
-                        };
-                        let _ = app.run("setvar", json!({"name": var, "value": i32::from(!value)}));
-                    }
-                }
-            }
-            if let Some((status, _)) = &app.status {
-                ui.label(status);
-            }
-        });
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let cancel = button(ui, "Cancel");
-            let enter = button(ui, "Enter");
-            let keyboard = cfg!(target_os = "android") && button(ui, "Keyboard");
-            let response = ui.add_sized(
-                vec2(ui.available_width().max(80.0), app.tablet_prefs.height()),
-                egui::TextEdit::singleline(&mut app.cmd.buffer).hint_text(crate::i18n::t("Command")).font(crate::theme::mono()),
-            );
-            let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if keyboard {
-                app.tablet_keyboard_requested = true;
-                response.surrender_focus();
-            }
-            if enter || submit {
-                let text = std::mem::take(&mut app.cmd.buffer);
-                let _ = app.cmdline(&text);
-                response.surrender_focus();
-            }
-            if cancel {
-                app.session.cancel();
-                app.cmd.buffer.clear();
-                response.surrender_focus();
-            }
-        });
     });
 }

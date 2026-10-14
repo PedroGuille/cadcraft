@@ -628,6 +628,8 @@ impl Shell {
                             } else if self.cad.ui.dialog.take().is_some() {
                             } else if self.cad.closing.is_some() {
                                 self.cad.answer_close(cadcraft_ui_egui::closing::Choice::Cancel);
+                            } else if self.cad.canvas.tablet_pan {
+                                self.cad.canvas.set_tablet_pan(false);
                             } else if self.cad.session.running.is_some() {
                                 self.cad.session.cancel();
                                 self.cad.cmd.buffer.clear();

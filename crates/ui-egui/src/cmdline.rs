@@ -302,6 +302,9 @@ pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
             egui::Event::Key { key, pressed: true, repeat, modifiers, .. } => match key {
                 Key::Enter => submit(app),
                 Key::Escape => {
+                    if app.tablet_mode && app.canvas.tablet_pan {
+                        app.canvas.set_tablet_pan(false);
+                    }
                     app.cmd.buffer.clear();
                     app.session.cancel();
                 }

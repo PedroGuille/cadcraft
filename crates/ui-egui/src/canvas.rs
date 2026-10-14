@@ -111,6 +111,8 @@ pub struct CanvasState {
     hover_at: Option<Pos2>,
     /// Tablets keep the crosshair visible after a touch ends or a pen leaves hover range.
     tablet_cursor: Option<Pos2>,
+    /// Explicit tablet navigation: primary drags pan without picks or selection windows.
+    pub tablet_pan: bool,
     tablet_taps: crate::tablet::Taps,
     tablet_pen_hover: bool,
     /// Physical canvas contacts stay suppressed until lift after a pen cancels a gesture.
@@ -168,11 +170,20 @@ impl Selection {
 }
 
 impl CanvasState {
+    pub fn set_tablet_pan(&mut self, active: bool) {
+        self.tablet_pan = active;
+        self.pan_last = None;
+        self.tablet_taps = Default::default();
+        self.drag_window = false;
+        self.snap = None;
+        self.track = None;
+    }
+
     /// The Android bridge emits pens as pointer events and fingers as touch events.
     /// Cancel tracked finger contacts before egui processes input, including their release;
     /// dropping releases would leave egui's multi-touch state stuck.
     pub fn filter_tablet_input(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, prefs: &crate::tablet::Preferences) {
-        if !prefs.pen_only {
+        if !prefs.pen_only || self.tablet_pan {
             self.tablet_fingers.clear();
             self.tablet_pen_hover = false;
             return;
@@ -1043,16 +1054,18 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             let _ = app.session.zoom_about(f64::from(gesture.zoom_delta), moved.to_world(gesture.center_pos));
         }
     }
-    let navigating = app.canvas.touch_navigation;
+    let hand_pan = app.tablet_mode && app.canvas.tablet_pan;
+    let finger_navigation = app.canvas.touch_navigation;
+    let navigating = finger_navigation || hand_pan;
     if !ui.input(|i| i.any_touches()) {
         app.canvas.touch_navigation = false;
     }
     let mut pressed_primary = pressed_primary && !navigating;
     let pressed_secondary = pressed_secondary && !navigating;
-    let mut inside = hover_pos.is_some_and(|p| rect.contains(p))
-        && (resp.hovered() || resp.clicked_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Secondary))
-        && !navigating;
-    let live_pointer = hover_pos.filter(|_| inside);
+    let pointer_inside = hover_pos.is_some_and(|p| rect.contains(p))
+        && (resp.hovered() || resp.clicked_by(egui::PointerButton::Primary) || resp.clicked_by(egui::PointerButton::Secondary));
+    let mut inside = pointer_inside && !navigating;
+    let live_pointer = hover_pos.filter(|_| pointer_inside);
     if app.tablet_mode {
         if let Some(pos) = live_pointer {
             app.canvas.tablet_cursor = Some(pos);
@@ -1158,10 +1171,12 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     // Pan with the middle button (or Shift+right-drag / two-finger drag on trackpads is scroll).
     let middle_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Middle));
+    let hand_down = hand_pan && !finger_navigation && ui.input(|i| i.pointer.primary_down());
+    let hand_pressed = hand_pan && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary));
     let focused = ui.input(|i| i.focused);
-    if middle_down
+    if (middle_down || hand_down)
         && focused
-        && (app.canvas.pan_last.is_some() || (middle_pressed && inside))
+        && (app.canvas.pan_last.is_some() || ((middle_pressed || hand_pressed) && pointer_inside))
         && let Some(hp) = hover_pos
     {
         if let Some(last) = app.canvas.pan_last {
@@ -1623,12 +1638,18 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     } else {
         hover_pos.filter(|_| inside)
     };
-    if inside {
+    if pointer_inside && hand_pan {
+        ui.ctx().set_cursor_icon(if hand_down { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+    } else if inside {
         // Hide the OS cursor under the drawn crosshair, unless assistive tech needs it (#39).
         ui.ctx().set_cursor_icon(if app.ui.system_cursor { egui::CursorIcon::Crosshair } else { egui::CursorIcon::None });
     }
     if let Some(pos) = crosshair {
-        draw_crosshair(app, &painter, rect, pos, selecting);
+        if hand_pan {
+            crate::icons::paint(&painter, Rect::from_center_size(pos, vec2(24.0, 24.0)), crate::icons::Icon::Pan, true);
+        } else {
+            draw_crosshair(app, &painter, rect, pos, selecting);
+        }
     }
     if inside
         && app.session.settings.dynmode

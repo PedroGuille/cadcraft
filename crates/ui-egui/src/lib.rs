@@ -321,6 +321,9 @@ impl CadApp {
         if menus::run_ui_command(self, name, &Value::Null).is_some() {
             return;
         }
+        if self.tablet_mode && self.canvas.tablet_pan {
+            self.canvas.set_tablet_pan(false);
+        }
         if let Err(e) = self.session.start(name) {
             self.session.echo(e.to_string());
         }
@@ -336,6 +339,9 @@ impl CadApp {
             if !first.is_empty() && !json_form && menus::run_ui_command(self, &first.to_ascii_lowercase(), &Value::Null).is_some() {
                 return None;
             }
+        }
+        if self.tablet_mode && self.canvas.tablet_pan {
+            self.canvas.set_tablet_pan(false);
         }
         let e = self.session.cmdline(text).err()?.to_string();
         self.session.echo(e.clone());
