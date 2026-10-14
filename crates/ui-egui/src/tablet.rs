@@ -165,7 +165,11 @@ impl Taps {
 }
 
 fn button(ui: &mut egui::Ui, text: &str) -> bool {
-    let response = ui.add(Button::new(crate::i18n::t(text)).min_size(vec2(36.0, ui.spacing().interact_size.y)));
+    labeled_button(ui, text, crate::i18n::t(text))
+}
+
+fn labeled_button(ui: &mut egui::Ui, text: &str, caption: &str) -> bool {
+    let response = ui.add(Button::new(caption).min_size(vec2(36.0, ui.spacing().interact_size.y))).on_hover_text(crate::i18n::t(text));
     crate::control::record_widget(ui, &response, text, "button", None);
     response.clicked()
 }
@@ -260,8 +264,10 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                             ("Properties", "ui.toggle.palettes"),
                             ("Layers", "ui.dialog.layers"),
                             ("Export PDF", "exportpdf"),
+                            ("Share PDF", "ui.tablet.sharepdf"),
+                            ("Drafting Settings", "ui.dialog.dsettings"),
                         ] {
-                            if button(ui, label) {
+                            if labeled_button(ui, label, crate::i18n::tablet(label)) {
                                 app.start(command);
                             }
                         }

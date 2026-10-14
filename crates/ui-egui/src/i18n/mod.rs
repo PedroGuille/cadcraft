@@ -207,6 +207,11 @@ pub fn t(source: &str) -> &str {
     CURRENT.with(|l| tr(l.get(), source))
 }
 
+/// Compact tablet captions fall back to the ordinary translation in other catalogs.
+pub fn tablet(source: &str) -> &str {
+    CURRENT.with(|l| catalog(l.get()).and_then(|c| c.get(&("tablet", source))).copied().unwrap_or_else(|| t(source)))
+}
+
 /// Menu headings can differ from command or object labels (e.g. Czech Kótování / Kóta).
 /// Catalogs without a `menu` entry retain their ordinary translation.
 pub fn tr_menu<'a>(language: &str, source: &'a str) -> &'a str {
