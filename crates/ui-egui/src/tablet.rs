@@ -40,6 +40,7 @@ impl Preferences {
 
 #[derive(Clone, Copy, Debug)]
 pub enum FileAction {
+    Drawings,
     Save,
     SaveAs,
     Export,
@@ -58,6 +59,7 @@ pub(crate) fn route(app: &mut CadApp, id: &str, params: &serde_json::Value) -> O
         return None;
     }
     let action = match id {
+        "ui.tablet.drawings" => FileAction::Drawings,
         "qsave" | "save" => FileAction::Save,
         "saveas" | "ui.saveas" => FileAction::SaveAs,
         "exportpdf" => FileAction::Pdf,
@@ -155,7 +157,7 @@ impl Taps {
 }
 
 fn button(ui: &mut egui::Ui, text: &str) -> bool {
-    ui.add_sized(vec2(72.0, ui.spacing().interact_size.y), Button::new(crate::i18n::t(text))).clicked()
+    ui.add(Button::new(crate::i18n::t(text)).min_size(vec2(36.0, ui.spacing().interact_size.y))).clicked()
 }
 
 pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
@@ -178,55 +180,58 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     let t = Tokens::get();
     egui::Panel::top("tablet-tools").frame(egui::Frame::NONE.fill(t.chrome).inner_margin(6.0)).show(ui, |ui| {
-        egui::ScrollArea::horizontal().id_salt("tablet-tool-scroll").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                for (icon, command, label) in [
-                    (Icon::New, "new", "New Drawing"),
-                    (Icon::Open, "ui.open", "Open"),
-                    (Icon::Save, "qsave", "Save"),
-                    (Icon::Undo, "u", "Undo"),
-                    (Icon::Redo, "redo", "Redo"),
-                    (Icon::ZoomExtents, "zoom.extents", "Zoom Extents"),
-                ] {
-                    if icons::button(ui, icon, app.tablet_prefs.height(), label, false).clicked() {
-                        app.start(command);
-                    }
-                }
-                ui.separator();
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.menu_button(crate::i18n::t("More"), |ui| {
                 for (label, command) in [
-                    ("Line", "line"),
-                    ("Polyline", "pline"),
-                    ("Circle", "circle"),
-                    ("Rectangle", "rectang"),
-                    ("Move", "move"),
-                    ("Offset", "offset"),
-                    ("Trim", "trim"),
-                    ("Measure", "dist"),
+                    ("Drawings", "ui.tablet.drawings"),
+                    ("Tool Sets", "ui.toggle.toolsets"),
+                    ("Drafting Settings", "ui.dialog.dsettings"),
+                    ("Options", "options"),
+                    ("Save As", "ui.saveas"),
+                    ("Export file", "ui.tablet.export"),
+                    ("Share drawing", "ui.tablet.share"),
+                    ("Share PDF", "ui.tablet.sharepdf"),
+                    ("Open linked drawing", "ui.tablet.link"),
+                    ("Open project folder", "ui.tablet.project"),
+                    ("Tablet Settings", "ui.tablet.settings"),
+                    ("Help", "ui.dialog.about"),
                 ] {
                     if button(ui, label) {
                         app.start(command);
+                        ui.close();
                     }
                 }
-                ui.menu_button(crate::i18n::t("More"), |ui| {
+            });
+            egui::ScrollArea::horizontal().id_salt("tablet-tool-scroll").auto_shrink([false, true]).show(ui, |ui| {
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    for (icon, command, label) in [
+                        (Icon::New, "new", "New Drawing"),
+                        (Icon::Open, "ui.open", "Open"),
+                        (Icon::Save, "qsave", "Save"),
+                        (Icon::Undo, "u", "Undo"),
+                        (Icon::Redo, "redo", "Redo"),
+                        (Icon::ZoomExtents, "zoom.extents", "Zoom Extents"),
+                    ] {
+                        if icons::button(ui, icon, app.tablet_prefs.height(), label, false).clicked() {
+                            app.start(command);
+                        }
+                    }
+                    ui.separator();
                     for (label, command) in [
-                        ("Tool Sets", "ui.toggle.toolsets"),
+                        ("Line", "line"),
+                        ("Polyline", "pline"),
+                        ("Circle", "circle"),
+                        ("Rectangle", "rectang"),
+                        ("Move", "move"),
+                        ("Offset", "offset"),
+                        ("Trim", "trim"),
+                        ("Measure", "dist"),
                         ("Properties", "ui.toggle.palettes"),
                         ("Layers", "ui.dialog.layers"),
-                        ("Drafting Settings", "ui.dialog.dsettings"),
-                        ("Options", "options"),
-                        ("Save As", "ui.saveas"),
-                        ("Export file", "ui.tablet.export"),
                         ("Export PDF", "exportpdf"),
-                        ("Share drawing", "ui.tablet.share"),
-                        ("Share PDF", "ui.tablet.sharepdf"),
-                        ("Open linked drawing", "ui.tablet.link"),
-                        ("Open project folder", "ui.tablet.project"),
-                        ("Tablet Settings", "ui.tablet.settings"),
-                        ("Help", "ui.dialog.about"),
                     ] {
                         if button(ui, label) {
                             app.start(command);
-                            ui.close();
                         }
                     }
                 });
@@ -250,7 +255,7 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                 for (name, value) in
                     [("Grid", app.session.settings.gridmode), ("Snap", app.session.settings.snapmode), ("Ortho", app.session.settings.orthomode)]
                 {
-                    if ui.add_sized(vec2(72.0, app.tablet_prefs.height()), Button::new(crate::i18n::t(name)).selected(value)).clicked() {
+                    if ui.add(Button::new(crate::i18n::t(name)).selected(value).min_size(vec2(36.0, app.tablet_prefs.height()))).clicked() {
                         let var = match name {
                             "Grid" => "GRIDMODE",
                             "Snap" => "SNAPMODE",
@@ -264,24 +269,25 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                 ui.label(status);
             }
         });
-        ui.horizontal_wrapped(|ui| {
-            let width = (ui.available_width() - if cfg!(target_os = "android") { 270.0 } else { 160.0 }).max(80.0);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let cancel = button(ui, "Cancel");
+            let enter = button(ui, "Enter");
+            let keyboard = cfg!(target_os = "android") && button(ui, "Keyboard");
             let response = ui.add_sized(
-                vec2(width.min(ui.available_width()), app.tablet_prefs.height()),
+                vec2(ui.available_width().max(80.0), app.tablet_prefs.height()),
                 egui::TextEdit::singleline(&mut app.cmd.buffer).hint_text(crate::i18n::t("Command")).font(crate::theme::mono()),
             );
             let submit = response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if cfg!(target_os = "android") && ui.add_sized(vec2(100.0, app.tablet_prefs.height()), Button::new(crate::i18n::t("Keyboard"))).clicked()
-            {
+            if keyboard {
                 app.tablet_keyboard_requested = true;
                 response.surrender_focus();
             }
-            if button(ui, "Enter") || submit {
+            if enter || submit {
                 let text = std::mem::take(&mut app.cmd.buffer);
                 let _ = app.cmdline(&text);
                 response.surrender_focus();
             }
-            if button(ui, "Cancel") {
+            if cancel {
                 app.session.cancel();
                 app.cmd.buffer.clear();
                 response.surrender_focus();

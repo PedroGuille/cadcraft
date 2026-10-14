@@ -476,7 +476,7 @@ impl CadApp {
         if self.tablet_mode {
             ctx.style_mut_of(shown, |style| {
                 style.spacing.interact_size.y = self.tablet_prefs.height();
-                style.spacing.button_padding = egui::vec2(8.0, 8.0);
+                style.spacing.button_padding = egui::vec2(4.0, 4.0);
             });
         }
         self.drain_control(ctx);

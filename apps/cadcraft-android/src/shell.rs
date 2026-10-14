@@ -47,6 +47,7 @@ pub struct Shell {
     files: Vec<PathBuf>,
     files_at: Instant,
     files_refresh: bool,
+    drawings_open: bool,
     render: Option<eframe::egui_wgpu::RenderState>,
     cache_mib: u32,
     #[cfg(target_os = "android")]
@@ -200,6 +201,7 @@ impl Shell {
             files: Vec::new(),
             files_at: Instant::now(),
             files_refresh: true,
+            drawings_open: false,
             render: cc.wgpu_render_state.clone(),
             cache_mib,
             #[cfg(target_os = "android")]
@@ -433,6 +435,7 @@ impl Shell {
     fn file_action(&mut self) {
         let Some(action) = self.cad.tablet_file_action.take() else { return };
         match action {
+            FileAction::Drawings => self.drawings_open = true,
             FileAction::Save if self.cad.session.state().is_ok_and(|d| d.path.is_none()) => self.request_name(),
             FileAction::Save => self.start_job(Action::Save),
             FileAction::SaveAs => self.request_name(),
@@ -449,6 +452,60 @@ impl Shell {
                 self.cad.set_status("This picker is available on Android");
             }
         }
+    }
+
+    fn drawings(&mut self, ctx: &egui::Context) {
+        if !self.drawings_open {
+            return;
+        }
+        if self.files_refresh || self.files_at.elapsed() > Duration::from_secs(30) {
+            self.files = files(&self.dir);
+            self.files_at = Instant::now();
+            self.files_refresh = false;
+        }
+        let mut open = true;
+        let mut selected = false;
+        egui::Window::new(cadcraft_ui_egui::i18n::t("Drawings")).id(egui::Id::new("tablet-drawings")).open(&mut open).default_width(400.0).show(
+            ctx,
+            |ui| {
+                if self.loader.is_some() || self.saving {
+                    ui.spinner();
+                }
+                egui::ScrollArea::vertical().max_height(ctx.content_rect().height() * 0.65).show(ui, |ui| {
+                    if self.files.is_empty() {
+                        ui.label(cadcraft_ui_egui::i18n::t("Open or save a drawing to see it here"));
+                    }
+                    for path in &self.files {
+                        let label = path.file_name().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+                        if ui.add_sized(egui::vec2(ui.available_width(), self.cad.tablet_prefs.height()), egui::Button::new(label)).clicked() {
+                            if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
+                                #[cfg(target_os = "android")]
+                                {
+                                    let name = path.file_name().map(|s| s.to_string_lossy()).unwrap_or_else(|| "Drawing.pdf".into());
+                                    if let Err(error) = crate::platform::export(&path.to_string_lossy(), &name) {
+                                        self.cad.set_status(error);
+                                    }
+                                }
+                            } else {
+                                self.cad.open_path(&path.to_string_lossy());
+                            }
+                            selected = true;
+                        }
+                    }
+                    if ui
+                        .add_sized(
+                            egui::vec2(ui.available_width(), self.cad.tablet_prefs.height()),
+                            egui::Button::new(cadcraft_ui_egui::i18n::t("Sample drawing")),
+                        )
+                        .clicked()
+                    {
+                        let _ = self.cad.run("ui.sample", json!({}));
+                        selected = true;
+                    }
+                });
+            },
+        );
+        self.drawings_open = open && !selected;
     }
 
     pub fn trim_render_cache(&mut self) {
@@ -564,6 +621,8 @@ impl Shell {
                         Some("back") => {
                             if egui::Popup::is_any_open(ctx) {
                                 egui::Popup::close_all(ctx);
+                            } else if self.drawings_open {
+                                self.drawings_open = false;
                             } else if self.cad.tablet_settings_open {
                                 self.cad.tablet_settings_open = false;
                             } else if self.cad.ui.dialog.take().is_some() {
@@ -627,61 +686,9 @@ impl eframe::App for Shell {
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         cadcraft_ui_egui::i18n::with_language(self.cad.language(), || {
-            egui::Panel::top("tablet-documents").frame(egui::Frame::NONE.inner_margin(6.0)).show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    ui.menu_button(cadcraft_ui_egui::i18n::t("Drawings"), |ui| {
-                        if self.files_refresh || self.files_at.elapsed() > Duration::from_secs(30) {
-                            self.files = files(&self.dir);
-                            self.files_at = Instant::now();
-                            self.files_refresh = false;
-                        }
-                        if self.files.is_empty() {
-                            ui.label(cadcraft_ui_egui::i18n::t("Open or save a drawing to see it here"));
-                        }
-                        for path in &self.files {
-                            let label = path.file_name().map_or_else(String::new, |s| s.to_string_lossy().into_owned());
-                            if ui.add_sized(egui::vec2(240.0, self.cad.tablet_prefs.height()), egui::Button::new(label)).clicked() {
-                                if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
-                                    #[cfg(target_os = "android")]
-                                    {
-                                        let name = path.file_name().map(|s| s.to_string_lossy()).unwrap_or_else(|| "Drawing.pdf".into());
-                                        let _ = crate::platform::export(&path.to_string_lossy(), &name);
-                                    }
-                                } else {
-                                    self.cad.open_path(&path.to_string_lossy());
-                                }
-                                ui.close();
-                            }
-                        }
-                        if ui
-                            .add_sized(
-                                egui::vec2(240.0, self.cad.tablet_prefs.height()),
-                                egui::Button::new(cadcraft_ui_egui::i18n::t("Sample drawing")),
-                            )
-                            .clicked()
-                        {
-                            let _ = self.cad.run("ui.sample", json!({}));
-                            ui.close();
-                        }
-                    });
-                    for (label, command) in [("Export file", "ui.tablet.export"), ("Export PDF", "exportpdf")] {
-                        if ui
-                            .add_sized(egui::vec2(110.0, self.cad.tablet_prefs.height()), egui::Button::new(cadcraft_ui_egui::i18n::t(label)))
-                            .clicked()
-                        {
-                            self.cad.start(command);
-                        }
-                    }
-                    if self.loader.is_some() || self.saving {
-                        ui.spinner();
-                    }
-                    if let Ok(doc) = self.cad.session.state() {
-                        ui.label(format!("{}{}", doc.title, if doc.is_dirty() { " *" } else { "" }));
-                    }
-                });
-            });
             self.cad.ui(ui);
             self.file_action();
+            self.drawings(ui.ctx());
             self.checkpoint();
         });
     }

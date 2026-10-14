@@ -10,6 +10,7 @@ pub const MENUS: &[&str] = &["File", "Edit", "View", "Insert", "Format", "Tools"
 
 /// UI-only commands: (id, label, menu path, shortcut).
 pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
+    ("ui.tablet.drawings", "Drawings", &[], None),
     ("ui.tablet.settings", "Tablet Settings", &[], None),
     ("ui.tablet.export", "Export file", &[], None),
     ("ui.tablet.share", "Share drawing", &[], None),
