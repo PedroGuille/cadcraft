@@ -252,6 +252,9 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                             }
                         }
                         ui.separator();
+                        if icons::button(ui, Icon::Pan, height, "Pan", app.canvas.tablet_pan).clicked() {
+                            app.start("ui.tablet.pan");
+                        }
                         for (label, command) in [
                             ("Line", "line"),
                             ("Polyline", "pline"),
@@ -266,19 +269,19 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                             ("Export PDF", "exportpdf"),
                             ("Share PDF", "ui.tablet.sharepdf"),
                             ("Drafting Settings", "ui.dialog.dsettings"),
+                            ("Options", "options"),
+                            ("Tablet Settings", "ui.tablet.settings"),
                         ] {
                             if labeled_button(ui, label, crate::i18n::tablet(label)) {
                                 app.start(command);
                             }
-                        }
-                        if icons::button(ui, Icon::Pan, height, "Pan", app.canvas.tablet_pan).clicked() {
-                            app.start("ui.tablet.pan");
                         }
                     });
                 });
         });
     });
     egui::Panel::bottom("tablet-command").frame(egui::Frame::NONE.fill(t.chrome).inner_margin(egui::Margin::symmetric(6, 0))).show(ui, |ui| {
+        ui.spacing_mut().button_padding.x *= 0.5;
         let prompt = app.session.current_prompt();
         let mut controls = button_width(ui, "Enter") + button_width(ui, "Cancel") + 2.0 * ui.spacing().item_spacing.x;
         if cfg!(target_os = "android") {
@@ -298,7 +301,10 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                     let response = ui
                         .add_sized(
                             vec2(width, app.tablet_prefs.height()),
-                            egui::TextEdit::singleline(&mut app.cmd.buffer).hint_text(crate::i18n::t(hint)).font(crate::theme::mono()),
+                            egui::TextEdit::singleline(&mut app.cmd.buffer)
+                                .hint_text(crate::i18n::t(hint))
+                                .font(crate::theme::mono())
+                                .margin(egui::Margin::symmetric(2, 2)),
                         )
                         .on_hover_text(crate::i18n::t(hint));
                     crate::control::record_widget(ui, &response, "Command", "textbox", None);
