@@ -53,6 +53,8 @@ pub struct CanvasState {
     space: cadcraft_doc::Space,
     source: Option<Arc<cadcraft_doc::Drawing>>,
     render_cache: cadcraft_render::screen::Cache,
+    /// Shared CPU cache allowance supplied by the tablet host.
+    cache_limit: Option<usize>,
     parts: Vec<cadcraft_render::screen::Part>,
     scenes: VecDeque<Scene>,
     part_meshes: HashMap<u64, Arc<crate::gpu::MeshData>>,
@@ -137,6 +139,7 @@ pub struct CanvasState {
     pub tablet_pan: bool,
     tablet_taps: crate::tablet::Taps,
     tablet_pen_hover: bool,
+    tablet_precise_pointer: bool,
     /// Physical canvas contacts stay suppressed until lift after a pen cancels a gesture.
     tablet_fingers: HashMap<(u64, u64), (Pos2, bool)>,
     /// Constraint glyphs for the parametric overlay (cached per drawing revision).
@@ -192,6 +195,34 @@ impl Selection {
 }
 
 impl CanvasState {
+    /// Bound reusable CPU geometry and inactive tabs together; the active list stays complete.
+    pub fn set_cache_budget(&mut self, bytes: usize) {
+        self.cache_limit = Some(bytes);
+        self.enforce_cache_budget();
+    }
+
+    fn enforce_cache_budget(&mut self) {
+        let Some(limit) = self.cache_limit else { return };
+        let half = limit / 2;
+        self.render_cache.set_budget(half);
+        if self.parts.iter().map(|p| cadcraft_render::screen::bytes(&p.list)).sum::<usize>() > half {
+            self.parts.clear();
+        }
+        let mut mesh_bytes = 0usize;
+        self.part_meshes.retain(|_, mesh| {
+            let bytes = mesh.cpu_bytes();
+            if bytes > half.saturating_sub(mesh_bytes) {
+                return false;
+            }
+            mesh_bytes = mesh_bytes.saturating_add(bytes);
+            true
+        });
+        let remaining = limit.saturating_sub(self.render_cache.bytes().saturating_add(mesh_bytes));
+        while self.scenes.iter().map(Scene::bytes).sum::<usize>() > remaining {
+            self.scenes.pop_front();
+        }
+    }
+
     pub fn set_tablet_pan(&mut self, active: bool) {
         self.tablet_pan = active;
         self.pan_last = None;
@@ -205,6 +236,18 @@ impl CanvasState {
     /// Cancel tracked finger contacts before egui processes input, including their release;
     /// dropping releases would leave egui's multi-touch state stuck.
     pub fn filter_tablet_input(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput, prefs: &crate::tablet::Preferences) {
+        // The native bridge emits pen/mouse events without Touch companions. Include Touch End
+        // positions too: a finger release must retain its double-tap handling after it lifts.
+        for event in &raw.events {
+            match event {
+                egui::Event::PointerMoved(pos) | egui::Event::PointerButton { pos, .. } => {
+                    self.tablet_precise_pointer =
+                        !raw.events.iter().any(|e| matches!(e, egui::Event::Touch { pos: touch, .. } if touch.distance(*pos) < 0.1));
+                }
+                egui::Event::PointerGone => self.tablet_precise_pointer = false,
+                _ => {}
+            }
+        }
         if !prefs.pen_only || self.tablet_pan {
             self.tablet_fingers.clear();
             self.tablet_pen_hover = false;
@@ -489,6 +532,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
         while app.canvas.scenes.len() > 3 || app.canvas.scenes.iter().map(Scene::bytes).sum::<usize>() > budget {
             app.canvas.scenes.pop_front();
         }
+        app.canvas.enforce_cache_budget();
     }
     // A background build that finished: use it unless the drawing has changed since it started
     // (or the list was dropped to force a rebuild).
@@ -503,6 +547,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
                     app.canvas.parts.clear();
                     app.canvas.part_meshes.clear();
                     app.canvas.install(job_key, window, *built);
+                    app.canvas.enforce_cache_budget();
                 }
             }
             rebuild::Poll::Lost => {
@@ -559,6 +604,9 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
         }
     }
     let space = st.space.clone();
+    if let Some(limit) = app.canvas.cache_limit {
+        app.canvas.render_cache.set_budget(limit / 2);
+    }
     let built = app.canvas.render_cache.build(&st.doc, &space, &opts);
     app.canvas.rebuilt_parts = built.rebuilt;
     app.canvas.reused_parts = built.reused;
@@ -569,6 +617,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     app.canvas.window = opts.view;
     app.canvas.list_gen = app.canvas.list_gen.wrapping_add(1);
     app.canvas.build_ms = crate::now_ms() - t0;
+    app.canvas.enforce_cache_budget();
 }
 
 /// The active MSPACE viewport when its contents are drawn apart from the layout's list (see
@@ -1166,7 +1215,8 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
     let bounds = c.window.as_ref().filter(|_| !c.parts.is_empty()).unwrap_or(&list.bounds);
     let origin = crate::gpu::choose_origin(bounds, xf.center, f64::from(xf.rect.height()) / xf.scale.max(1e-300));
     let key = list_mesh_key(&c.key, c.list_gen, origin, bg, lwdisplay);
-    if c.mesh_key != Some(key) {
+    let rebuilt = c.mesh_key != Some(key);
+    if rebuilt {
         let t0 = crate::now_ms();
         let mesh = if c.parts.is_empty() {
             let mesh = crate::gpu::build_mesh(list, origin, bg, lwdisplay);
@@ -1189,7 +1239,17 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
                 next.insert(id, data.clone());
                 mesh.parts.push((id, data));
             }
-            c.part_meshes = if next.values().map(|m| m.bytes()).sum::<usize>() <= 32 << 20 { next } else { HashMap::new() };
+            let limit = c.cache_limit.map_or(32 << 20, |limit| limit / 2);
+            let mut retained = 0usize;
+            next.retain(|_, mesh| {
+                let bytes = mesh.cpu_bytes();
+                if bytes > limit.saturating_sub(retained) {
+                    return false;
+                }
+                retained = retained.saturating_add(bytes);
+                true
+            });
+            c.part_meshes = next;
             mesh
         };
         if let Ok(mut slot) = c.mesh_slot.lock() {
@@ -1225,6 +1285,9 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
         }
     }
     p.extend(shapes);
+    if rebuilt {
+        c.enforce_cache_budget();
+    }
 }
 
 /// How a highlight is drawn: lines `width` points wide, and either solid with fills filled or
@@ -1557,12 +1620,11 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         let doc = app.session.state().map_or(0, |s| s.uid);
         let command = app.session.running.as_ref().map(|r| r.id.as_str());
+        let precise_input = app.canvas.tablet_precise_pointer || app.canvas.tablet_pen_hover;
         let cancelled = ui.input(|i| {
             i.raw.events.iter().any(|e| {
-                matches!(
-                    e,
-                    egui::Event::Touch { phase: egui::TouchPhase::Cancel, .. } | egui::Event::Key { key: egui::Key::Escape, pressed: true, .. }
-                )
+                matches!(e, egui::Event::Key { key: egui::Key::Escape, pressed: true, .. })
+                    || (!precise_input && matches!(e, egui::Event::Touch { phase: egui::TouchPhase::Cancel, .. }))
             })
         });
         let barrel = app.tablet_prefs.barrel_cancel && inside && ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
@@ -1577,17 +1639,18 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             || resp.dragged_by(egui::PointerButton::Primary)
             || scroll != egui::Vec2::ZERO
             || (ui.input(|i| i.zoom_delta()) - 1.0).abs() > 1e-4;
+        let delay_pick = app.tablet_prefs.double_tap_cancel && !(app.tablet_prefs.immediate_pen && precise_input);
         let delayed = app.canvas.tablet_taps.update(
             ui.ctx(),
             doc,
             command,
-            hover_pos.filter(|_| app.tablet_prefs.double_tap_cancel && inside && pressed_primary).map(|p| (p, mods)),
-            app.tablet_prefs.double_tap_cancel && inside && dbl_primary,
-            blocked || !app.tablet_prefs.double_tap_cancel,
+            hover_pos.filter(|_| delay_pick && inside && pressed_primary).map(|p| (p, mods)),
+            delay_pick && inside && dbl_primary,
+            blocked || !delay_pick,
         );
         let tap = if barrel {
             crate::tablet::TapAction::Cancel
-        } else if !app.tablet_prefs.double_tap_cancel && !blocked && inside && pressed_primary {
+        } else if !delay_pick && !blocked && inside && pressed_primary {
             hover_pos.map_or(crate::tablet::TapAction::None, |pos| crate::tablet::TapAction::Pick(pos, mods))
         } else {
             delayed

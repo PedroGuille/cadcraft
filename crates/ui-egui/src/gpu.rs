@@ -156,6 +156,13 @@ impl MeshData {
     pub fn bytes(&self) -> usize {
         self.lines.len().saturating_add(self.tris.len()).saturating_add(self.quads.len())
     }
+    pub fn cpu_bytes(&self) -> usize {
+        self.lines
+            .capacity()
+            .saturating_add(self.tris.capacity())
+            .saturating_add(self.quads.capacity())
+            .saturating_add(self.breaks.capacity().saturating_mul(std::mem::size_of::<[usize; 3]>()))
+    }
 }
 
 fn rel(p: Vec2, origin: Vec2) -> [f32; 2] {
@@ -394,7 +401,7 @@ struct Layer {
     breaks: Vec<[usize; 3]>,
     parts: std::collections::VecDeque<(u64, std::sync::Arc<Uploaded>)>,
     part_bytes: usize,
-    part_limit: usize,
+    active_parts: std::collections::HashSet<u64>,
 }
 
 impl Uploaded {
@@ -415,6 +422,7 @@ impl Uploaded {
 
 impl Layer {
     fn load(&mut self, device: &wgpu::Device, mesh: MeshData) {
+        self.active_parts.clear();
         if mesh.parts.is_empty() {
             let data = Uploaded::new(device, &mesh);
             self.lines = data.lines;
@@ -429,6 +437,7 @@ impl Layer {
         self.breaks.clear();
         let mut offset = [0usize; 3];
         for (id, m) in mesh.parts {
+            self.active_parts.insert(id);
             let existing = self.parts.iter().position(|(key, _)| *key == id).and_then(|i| self.parts.remove(i));
             let data = if let Some((_, data)) = existing {
                 self.part_bytes = self.part_bytes.saturating_sub(data.bytes);
@@ -443,11 +452,11 @@ impl Layer {
             self.lines.extend_from_slice(&data.lines);
             self.tris.extend_from_slice(&data.tris);
             self.quads.extend_from_slice(&data.quads);
-            if data.bytes <= self.part_limit {
-                self.part_bytes = self.part_bytes.saturating_add(data.bytes);
-                self.parts.push_back((id, data));
-            }
-            while self.part_bytes > self.part_limit || self.parts.len() > 4096 {
+            // Active buffers are already required by lines/tris/quads. Retaining their handles
+            // costs no additional GPU storage and lets the next edit reuse unchanged chunks.
+            self.part_bytes = self.part_bytes.saturating_add(data.bytes);
+            self.parts.push_back((id, data));
+            while self.parts.len() > 4096 {
                 let Some((_, old)) = self.parts.pop_front() else { break };
                 self.part_bytes = self.part_bytes.saturating_sub(old.bytes);
             }
@@ -463,6 +472,7 @@ struct Resources {
     clipped: Option<ClipPipelines>,
     linear_out: bool,
     layers: Vec<Layer>,
+    cache_limit: usize,
 }
 
 struct ClipPipelines {
@@ -612,7 +622,7 @@ impl Resources {
                 breaks: Vec::new(),
                 parts: std::collections::VecDeque::new(),
                 part_bytes: 0,
-                part_limit: 64 << 20,
+                active_parts: Default::default(),
             }
         };
         // A render pass with a stencil buffer needs every pipeline to name its format; only the
@@ -679,6 +689,7 @@ impl Resources {
             }),
             linear_out: target.format.is_srgb(),
             layers: (0..=LAYER_MASK).map(|_| layer()).collect(),
+            cache_limit: 64 << 20,
         }
     }
 }
@@ -775,15 +786,30 @@ pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Op
     target
 }
 
+impl Layer {
+    fn retained_bytes(&self) -> usize {
+        self.parts.iter().filter(|(id, _)| !self.active_parts.contains(id)).map(|(_, p)| p.bytes).sum()
+    }
+}
+
+impl Resources {
+    fn trim_retained(&mut self) {
+        let mut bytes: usize = self.layers.iter().map(Layer::retained_bytes).sum();
+        while bytes > self.cache_limit {
+            let Some(layer) = self.layers.iter_mut().max_by_key(|l| l.retained_bytes()) else { break };
+            let Some(at) = layer.parts.iter().position(|(id, _)| !layer.active_parts.contains(id)) else { break };
+            let Some((_, old)) = layer.parts.remove(at) else { break };
+            layer.part_bytes = layer.part_bytes.saturating_sub(old.bytes);
+            bytes = bytes.saturating_sub(old.bytes);
+        }
+    }
+}
+
+/// One allowance shared by every retained GPU layer, apart from buffers needed for this frame.
 pub fn set_cache_budget(rs: &egui_wgpu::RenderState, mib: u32) {
     if let Some(resources) = rs.renderer.write().callback_resources.get_mut::<Resources>() {
-        for layer in &mut resources.layers {
-            layer.part_limit = (mib.clamp(8, 64) as usize) << 20;
-            while layer.part_bytes > layer.part_limit {
-                let Some((_, old)) = layer.parts.pop_front() else { break };
-                layer.part_bytes = layer.part_bytes.saturating_sub(old.bytes);
-            }
-        }
+        resources.cache_limit = (mib.min(64) as usize) << 20;
+        resources.trim_retained();
     }
 }
 
@@ -796,6 +822,7 @@ pub fn trim_cache(rs: &egui_wgpu::RenderState) {
             layer.quads.clear();
             layer.breaks.clear();
             layer.parts.clear();
+            layer.active_parts.clear();
             layer.part_bytes = 0;
         }
     }
@@ -812,14 +839,20 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(res) = resources.get_mut::<Resources>() else { return Vec::new() };
         let linear_out = res.linear_out;
-        let Some(res) = res.layers.get_mut(self.layer) else { return Vec::new() };
-        if res.key != Some(self.key) {
+        let Some(layer) = res.layers.get_mut(self.layer) else { return Vec::new() };
+        let mut changed = false;
+        if layer.key != Some(self.key) {
             let pending = self.slot.lock().ok().and_then(|mut s| s.take());
             if let Some(m) = pending {
-                res.load(device, m);
-                res.key = Some(self.key);
+                layer.load(device, m);
+                layer.key = Some(self.key);
+                changed = true;
             }
         }
+        if changed {
+            res.trim_retained();
+        }
+        let Some(res) = res.layers.get(self.layer) else { return Vec::new() };
         let ppp = screen.pixels_per_point;
         let [w, h] = screen.size_in_pixels;
         let a = [self.offset[0], self.offset[1], self.scale * ppp, if linear_out { 1.0 } else { 0.0 }];

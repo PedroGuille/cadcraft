@@ -15,11 +15,29 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[derive(Clone, PartialEq, Eq)]
+struct ContentKey {
+    revision: u64,
+    pointer: usize,
+    host: usize,
+    block: Option<String>,
+}
+
+impl ContentKey {
+    fn of(d: &cadcraft_engine::DocState) -> Self {
+        Self {
+            revision: d.revision,
+            pointer: Arc::as_ptr(&d.doc) as usize,
+            host: Arc::as_ptr(d.drawing()) as usize,
+            block: d.block_editor().map(str::to_owned),
+        }
+    }
+}
+
 #[derive(PartialEq, Eq)]
 struct Key {
     uid: u64,
-    revision: u64,
-    pointer: usize,
+    content: ContentKey,
     dirty: bool,
     title: String,
     path: Option<String>,
@@ -41,6 +59,8 @@ pub struct Shell {
     checkpoint_key: Vec<Key>,
     checkpoint_active: usize,
     checkpoint_prefs: (String, String),
+    preferences_at: Instant,
+    snapshots: HashMap<u64, (ContentKey, Arc<cadcraft_engine::doc::Drawing>)>,
     saves: jobs::Worker,
     saving: bool,
     name_uid: Option<u64>,
@@ -50,6 +70,8 @@ pub struct Shell {
     drawings_open: bool,
     render: Option<eframe::egui_wgpu::RenderState>,
     cache_mib: u32,
+    requested_cache_mib: u32,
+    memory_at: Instant,
     #[cfg(target_os = "android")]
     native_language: Option<&'static str>,
 }
@@ -166,6 +188,7 @@ impl Shell {
         cad.enable_autosave(&dir.join("autosave"));
         cad.autosave = None;
         cad.opening.set_repaint_context(cc.egui_ctx.clone());
+        cad.opening.set_parallel_reads(1);
         if let Some(rs) = &cc.wgpu_render_state {
             cad.set_wgpu(rs, None);
         }
@@ -176,14 +199,13 @@ impl Shell {
         let max_bytes = crate::platform::memory_budget().unwrap_or(64 << 20);
         #[cfg(not(target_os = "android"))]
         let max_bytes = 256 << 20;
-        cad.tablet_prefs.cache_mib = cad.tablet_prefs.cache_mib.min((max_bytes >> 22).clamp(8, 64) as u32);
         let cache_mib = cad.tablet_prefs.cache_mib;
         if let Some(rs) = &cc.wgpu_render_state {
             cadcraft_ui_egui::gpu::set_cache_budget(rs, cache_mib);
         }
         let loader = recovery::load(dir.clone(), max_bytes, cc.egui_ctx.clone())?;
         let saves = jobs::Worker::start(cc.egui_ctx.clone())?;
-        Ok(Self {
+        let mut shell = Self {
             cad,
             dir,
             writer,
@@ -195,6 +217,8 @@ impl Shell {
             checkpoint_key: Vec::new(),
             checkpoint_active: usize::MAX,
             checkpoint_prefs: (String::new(), String::new()),
+            preferences_at: Instant::now(),
+            snapshots: HashMap::new(),
             saves,
             saving: false,
             name_uid: None,
@@ -204,9 +228,13 @@ impl Shell {
             drawings_open: false,
             render: cc.wgpu_render_state.clone(),
             cache_mib,
+            requested_cache_mib: cache_mib,
+            memory_at: Instant::now(),
             #[cfg(target_os = "android")]
             native_language: None,
-        })
+        };
+        shell.tune_cache(true);
+        Ok(shell)
     }
 
     fn restore_tick(&mut self) {
@@ -223,6 +251,7 @@ impl Shell {
                     self.restored.insert(state.uid, (state.doc.clone(), file));
                     self.restore_order.insert(state.uid, index);
                     self.cad.session.docs.push(*state);
+                    self.cad.session.active = self.cad.session.docs.len().saturating_sub(1);
                     self.cad.ui.start_tab = false;
                 }
                 Loaded::Notice(message) => self.cad.set_status(message),
@@ -243,7 +272,7 @@ impl Shell {
         }
     }
 
-    fn checkpoint(&mut self) {
+    fn checkpoint(&mut self, force_preferences: bool) {
         while let Ok(result) = self.writer.notices.try_recv() {
             if let Err(error) = result {
                 self.checkpoint_key.clear();
@@ -264,8 +293,7 @@ impl Shell {
                 let view = d.paper_view();
                 Key {
                     uid: d.uid,
-                    revision: d.revision,
-                    pointer: Arc::as_ptr(&d.doc) as usize,
+                    content: ContentKey::of(d),
                     dirty: d.is_dirty(),
                     title: d.title.clone(),
                     path: d.path.clone(),
@@ -276,11 +304,21 @@ impl Shell {
                 }
             })
             .collect();
-        let prefs = (self.cad.prefs_json(), self.cad.profile_json());
-        if key == self.checkpoint_key && self.cad.session.active == self.checkpoint_active && prefs == self.checkpoint_prefs {
+        // Pointer input need not serialize the entire user profile twice per frame. A final
+        // delayed frame and pause/exit capture preferences after the last interaction.
+        let preferences = if force_preferences || self.checkpoint_prefs.0.is_empty() || self.preferences_at.elapsed() >= Duration::from_millis(500) {
+            self.preferences_at = Instant::now();
+            Some((self.cad.prefs_json(), self.cad.profile_json()))
+        } else {
+            None
+        };
+        let prefs = preferences.as_ref().unwrap_or(&self.checkpoint_prefs);
+        if key == self.checkpoint_key && self.cad.session.active == self.checkpoint_active && *prefs == self.checkpoint_prefs {
             return;
         }
         self.restored.retain(|uid, (doc, _)| self.cad.session.docs.iter().any(|s| s.uid == *uid && Arc::ptr_eq(doc, &s.doc)));
+        self.snapshots.retain(|uid, _| self.cad.session.docs.iter().any(|d| d.uid == *uid));
+        let snapshots = &mut self.snapshots;
         let docs = self
             .cad
             .session
@@ -288,9 +326,20 @@ impl Shell {
             .iter()
             .map(|d| {
                 let view = d.paper_view();
+                let content = ContentKey::of(d);
+                let drawing = match snapshots.get(&d.uid).filter(|(old, _)| *old == content) {
+                    Some((_, drawing)) => drawing.clone(),
+                    None => {
+                        // Own the outer snapshot: retaining the live document's Arc would make
+                        // view changes trigger copy-on-write and invalidate otherwise unchanged geometry.
+                        let drawing = Arc::new((*d.recovery_drawing()).clone());
+                        snapshots.insert(d.uid, (content, drawing.clone()));
+                        drawing
+                    }
+                };
                 recovery::Document {
                     uid: d.uid,
-                    drawing: Arc::new((*d.recovery_drawing()).clone()),
+                    drawing,
                     reuse: self.restored.get(&d.uid).map(|(_, file)| file.clone()),
                     record: json!({"title": d.title, "path": d.path, "dirty": d.is_dirty(), "space": d.space, "mspace": d.mspace.map(|h| h.0),
                     "center": [view.center.x, view.center.y], "height": view.height, "binaryDxf": d.binary_dxf}),
@@ -306,7 +355,9 @@ impl Shell {
         });
         self.checkpoint_key = key;
         self.checkpoint_active = self.cad.session.active;
-        self.checkpoint_prefs = prefs;
+        if let Some(prefs) = preferences {
+            self.checkpoint_prefs = prefs;
+        }
     }
 
     fn request_name(&mut self) {
@@ -465,6 +516,7 @@ impl Shell {
         }
         let mut open = true;
         let mut selected = false;
+        let mut restore = None;
         egui::Window::new(cadcraft_ui_egui::i18n::t("Drawings")).id(egui::Id::new("tablet-drawings")).open(&mut open).default_width(400.0).show(
             ctx,
             |ui| {
@@ -472,7 +524,15 @@ impl Shell {
                     ui.spinner();
                 }
                 egui::ScrollArea::vertical().max_height(ctx.content_rect().height() * 0.65).show(ui, |ui| {
-                    if self.files.is_empty() {
+                    for (index, record) in self.retained.iter().enumerate().filter_map(|(i, r)| r.as_ref().map(|r| (i, r))) {
+                        let title = record.get("title").and_then(Value::as_str).unwrap_or("Drawing");
+                        let label = format!("{}: {title}", cadcraft_ui_egui::i18n::t("Restore drawing"));
+                        if ui.add_enabled(self.loader.is_none(), egui::Button::new(label)).clicked() {
+                            restore = Some((index, record.clone()));
+                            selected = true;
+                        }
+                    }
+                    if self.files.is_empty() && self.retained.iter().all(Option::is_none) {
                         ui.label(cadcraft_ui_egui::i18n::t("Open or save a drawing to see it here"));
                     }
                     for path in &self.files {
@@ -505,7 +565,42 @@ impl Shell {
                 });
             },
         );
+        if let Some((index, record)) = restore {
+            #[cfg(target_os = "android")]
+            let max_bytes = crate::platform::memory_budget().unwrap_or(64 << 20);
+            #[cfg(not(target_os = "android"))]
+            let max_bytes = 256 << 20;
+            match recovery::load_record(self.dir.clone(), index, record, max_bytes, ctx.clone()) {
+                Ok(loader) => self.loader = Some(loader),
+                Err(error) => self.cad.set_status(error),
+            }
+        }
         self.drawings_open = open && !selected;
+    }
+
+    fn tune_cache(&mut self, force: bool) {
+        if !force && self.requested_cache_mib == self.cad.tablet_prefs.cache_mib && self.memory_at.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        // The requested allowance is an upper bound. The active drawing and undo remain intact;
+        // native memory and system headroom determine how much reusable geometry to retain.
+        let requested = self.cad.tablet_prefs.cache_mib;
+        self.requested_cache_mib = requested;
+        #[cfg(target_os = "android")]
+        let mib = crate::platform::memory_state()
+            .map(|state| crate::memory::cache_mib(requested, crate::memory::resident_bytes(), state))
+            .unwrap_or(requested);
+        #[cfg(not(target_os = "android"))]
+        let mib = requested;
+        self.memory_at = Instant::now();
+        if force || self.cache_mib != mib {
+            self.cache_mib = mib;
+            let gpu = mib / 4;
+            self.cad.canvas.set_cache_budget(((mib - gpu) as usize) << 20);
+            if let Some(rs) = &self.render {
+                cadcraft_ui_egui::gpu::set_cache_budget(rs, gpu);
+            }
+        }
     }
 
     pub fn trim_render_cache(&mut self) {
@@ -634,7 +729,7 @@ impl Shell {
                                 self.cad.session.cancel();
                                 self.cad.cmd.buffer.clear();
                             } else {
-                                self.checkpoint();
+                                self.checkpoint(false);
                                 self.writer.control.flush();
                                 let _ = crate::platform::background();
                             }
@@ -658,6 +753,9 @@ impl eframe::App for Shell {
         self.cad.canvas.filter_tablet_input(ctx, raw, &self.cad.tablet_prefs);
         self.cad.raw_input_hook(raw);
         cadcraft_ui_egui::cmdline::capture_tab(ctx, raw);
+        if !raw.events.is_empty() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
     }
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         cadcraft_ui_egui::i18n::with_language(self.cad.language(), || {
@@ -667,17 +765,16 @@ impl eframe::App for Shell {
             self.poll_documents(ctx);
             self.file_action();
             self.cad.logic(ctx);
-            self.checkpoint();
+            // Logic may run without a visible UI pass (pause or a native picker). Capture edits
+            // here too; unchanged content reuses its snapshot and does not serialize preferences.
+            self.checkpoint(false);
             if !ctx.input(|i| i.focused) {
+                self.checkpoint(true);
                 self.writer.control.flush();
             }
-            if self.cache_mib != self.cad.tablet_prefs.cache_mib {
-                self.cache_mib = self.cad.tablet_prefs.cache_mib;
-                if let Some(rs) = &self.render {
-                    cadcraft_ui_egui::gpu::set_cache_budget(rs, self.cache_mib);
-                }
-            }
+            self.tune_cache(false);
             if std::mem::take(&mut self.cad.quit_requested) {
+                self.checkpoint(true);
                 self.writer.control.flush();
                 #[cfg(target_os = "android")]
                 let _ = crate::platform::background();
@@ -691,7 +788,7 @@ impl eframe::App for Shell {
             self.cad.ui(ui);
             self.file_action();
             self.drawings(ui.ctx());
-            self.checkpoint();
+            self.checkpoint(false);
         });
     }
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -705,7 +802,7 @@ impl eframe::App for Shell {
         false
     }
     fn on_exit(&mut self) {
-        self.checkpoint();
+        self.checkpoint(true);
         self.writer.control.flush();
     }
 }

@@ -12,7 +12,7 @@ use cadcraft_geom::Mat3;
 
 use crate::{Builder, DisplayList, MAX_BLOCK_EXPANSION, Options, entity, top_ctx};
 
-// The joined list needs the same space again. Oversized scenes use the existing full builder.
+// Additional geometry retained for reuse, apart from the list needed to draw the scene.
 const MAX_BYTES: usize = 32 << 20;
 static NEXT_PART: AtomicU64 = AtomicU64::new(1);
 
@@ -35,13 +35,20 @@ pub struct Built {
     pub reused: usize,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Cache {
     // Retaining the snapshot prevents a freed chunk address from being reused as a cache key.
     drawing: Option<Arc<Drawing>>,
     options: Option<Options>,
     font_revision: u64,
     chunks: HashMap<usize, Part>,
+    limit: usize,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self { drawing: None, options: None, font_revision: 0, chunks: HashMap::new(), limit: MAX_BYTES }
+    }
 }
 
 impl Cache {
@@ -49,9 +56,27 @@ impl Cache {
         self.chunks.values().map(|p| bytes(&p.list)).sum()
     }
 
+    /// Retain as many individual chunks as fit; the active drawing is never truncated.
+    pub fn set_budget(&mut self, bytes: usize) {
+        self.limit = bytes;
+        let mut used = 0usize;
+        self.chunks.retain(|_, part| {
+            let size = crate::screen::bytes(&part.list);
+            if size > self.limit.saturating_sub(used) {
+                return false;
+            }
+            used = used.saturating_add(size);
+            true
+        });
+        if self.chunks.is_empty() {
+            self.drawing = None;
+        }
+    }
+
     pub fn build(&mut self, drawing: &Arc<Drawing>, space: &Space, options: &Options) -> Built {
         let fallback = |this: &mut Self| {
-            *this = Self::default();
+            let limit = this.limit;
+            *this = Self { limit, ..Self::default() };
             Built { list: crate::build(drawing, space, options), parts: Vec::new(), rebuilt: 0, reused: 0 }
         };
         if *space != Space::Model || options.plot_style_table.is_some() {
@@ -102,33 +127,37 @@ impl Cache {
             return fallback(self);
         }
         let rebuilt = made.len();
-        let mut next: HashMap<_, _> = made.into_iter().collect();
-        let mut parts = Vec::with_capacity(chunks.len());
-        let mut size = 0usize;
-        for (key, _) in chunks {
-            let Some(part) = next.get(&key).or_else(|| self.chunks.get(&key)).cloned() else { return fallback(self) };
-            size = size.saturating_add(bytes(&part.list));
-            if size > MAX_BYTES {
-                drop(part);
-                drop(parts);
-                drop(next);
-                return fallback(self);
-            }
-            next.insert(key, part.clone());
-            parts.push(part);
+        let mut made: HashMap<_, _> = made.into_iter().collect();
+        let lists: Vec<_> = chunks.iter().filter_map(|(key, _)| made.get(key).or_else(|| self.chunks.get(key))).map(|p| &p.list).collect();
+        if lists.len() != chunks.len() {
+            return fallback(self);
         }
+        let complete = lists.iter().map(|list| bytes(list)).sum::<usize>() <= self.limit;
         let mut list = DisplayList::default();
-        list.prims.reserve(parts.iter().map(|p| p.list.prims.len()).sum());
-        list.verts.reserve(parts.iter().map(|p| p.list.verts.len()).sum());
-        list.tris.reserve(parts.iter().map(|p| p.list.tris.len()).sum());
-        for part in &parts {
+        list.prims.reserve(lists.iter().map(|p| p.prims.len()).sum());
+        list.verts.reserve(lists.iter().map(|p| p.verts.len()).sum());
+        list.tris.reserve(lists.iter().map(|p| p.tris.len()).sum());
+        drop(lists);
+        let mut next = HashMap::new();
+        let mut parts = Vec::new();
+        let mut retained = 0usize;
+        for (key, _) in chunks {
+            let Some(part) = made.remove(&key).or_else(|| self.chunks.remove(&key)) else { return fallback(self) };
             append(&mut list, &part.list);
+            if complete {
+                parts.push(part.clone());
+            }
+            let size = bytes(&part.list);
+            if size <= self.limit.saturating_sub(retained) {
+                retained = retained.saturating_add(size);
+                next.insert(key, part);
+            }
         }
         self.chunks = next;
         self.options = Some(options);
         self.font_revision = font_revision;
         self.drawing = Some(Arc::new((**drawing).clone()));
-        Built { reused: parts.len().saturating_sub(rebuilt), rebuilt, list, parts }
+        Built { reused: drawing.model.chunk_slices().count().saturating_sub(rebuilt), rebuilt, list, parts }
     }
 }
 

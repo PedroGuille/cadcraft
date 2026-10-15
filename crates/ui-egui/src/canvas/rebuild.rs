@@ -101,6 +101,9 @@ impl Job {
 /// Build `req` on the calling thread; `None` once it has been cancelled (the partial list is
 /// thrown away, and no vertex data is made for it).
 fn run(req: Request) -> Option<Built> {
+    if req.opts.cancelled() {
+        return None;
+    }
     let t0 = crate::now_ms();
     let list = cadcraft_render::build(&req.doc, &req.space, &req.opts);
     if req.opts.cancelled() {
@@ -127,37 +130,74 @@ fn run(req: Request) -> Option<Built> {
     Some(Built { list, build_ms, mesh })
 }
 
-/// Start building `req` on a worker thread for `key` / `window`; the worker asks `ctx` for a
-/// frame when it is done. `None` when there are no threads (the web build) or none could be
-/// started: the caller builds synchronously.
+// A single worker keeps one active build and only the latest pending view. Replacing a
+// pending request drops its drawing and GPU references immediately instead of spawning another
+// thread while the cancelled build is still unwinding.
+#[cfg(not(target_arch = "wasm32"))]
+struct Task {
+    req: Request,
+    tx: std::sync::mpsc::SyncSender<Built>,
+    ctx: egui::Context,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct Worker {
+    pending: std::sync::Mutex<Option<Task>>,
+    ready: std::sync::Condvar,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn worker() -> Option<&'static Arc<Worker>> {
+    static WORKER: std::sync::OnceLock<Option<Arc<Worker>>> = std::sync::OnceLock::new();
+    WORKER
+        .get_or_init(|| {
+            let worker = Arc::new(Worker::default());
+            let state = worker.clone();
+            std::thread::Builder::new()
+                .name("cadcraft-regen".into())
+                .spawn(move || {
+                    loop {
+                        let Ok(mut pending) = state.pending.lock() else { break };
+                        while pending.is_none() {
+                            let Ok(next) = state.ready.wait(pending) else { return };
+                            pending = next;
+                        }
+                        let task = pending.take();
+                        drop(pending);
+                        let Some(Task { req, tx, ctx }) = task else { continue };
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(req))) {
+                            Ok(None) => {}
+                            Ok(Some(built)) => {
+                                let _ = tx.send(built);
+                                ctx.request_repaint();
+                            }
+                            Err(_) => {
+                                drop(tx);
+                                ctx.request_repaint();
+                            }
+                        }
+                    }
+                })
+                .map(|_| worker)
+                .map_err(|e| log::warn!("canvas: could not start a regen worker ({e})"))
+                .ok()
+        })
+        .as_ref()
+}
+
+/// Queue the latest view on a bounded worker; the old list remains drawable until it completes.
+/// Without threads or a usable worker the caller retains the synchronous fallback.
 #[cfg(not(target_arch = "wasm32"))]
 pub(super) fn spawn(mut req: Request, key: super::ListKey, window: Option<Bounds2>, ctx: &egui::Context) -> Option<Job> {
-    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = worker()?;
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     let cancel = Arc::new(AtomicBool::new(false));
     req.opts.cancel = Some(cancel.clone());
-    let ctx = ctx.clone();
-    let spawned = std::thread::Builder::new().name("cadcraft-regen".into()).spawn(move || {
-        // A panic drops `tx` unsent: the canvas sees the job as lost and builds on its own. A
-        // cancelled build sends nothing either, but its job is gone and nobody is listening.
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(req))) {
-            Ok(None) => {}
-            Ok(Some(built)) => {
-                let _ = tx.send(built);
-                ctx.request_repaint();
-            }
-            Err(_) => {
-                drop(tx);
-                ctx.request_repaint();
-            }
-        }
-    });
-    match spawned {
-        Ok(_) => Some(Job { key, window, rx, cancel }),
-        Err(e) => {
-            log::warn!("canvas: could not start a regen thread ({e}); rebuilding on the UI thread");
-            None
-        }
-    }
+    let mut pending = worker.pending.lock().ok()?;
+    *pending = Some(Task { req, tx, ctx: ctx.clone() });
+    worker.ready.notify_one();
+    Some(Job { key, window, rx, cancel })
 }
 
 #[cfg(target_arch = "wasm32")]

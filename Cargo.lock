@@ -605,6 +605,7 @@ dependencies = [
  "egui",
  "jni 0.21.1",
  "log",
+ "rayon",
  "robius-android-env",
  "serde_json",
  "winit",

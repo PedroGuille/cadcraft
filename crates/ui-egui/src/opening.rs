@@ -15,14 +15,20 @@ type Outcome = Result<ReadFile, String>;
 struct Job {
     path: String,
     started: Instant,
-    rx: Receiver<Outcome>,
+    rx: Option<Receiver<Outcome>>,
 }
 
 /// The files being read in the background, oldest first.
-#[derive(Default)]
 pub struct Opening {
     jobs: Vec<Job>,
     repaint: Option<egui::Context>,
+    parallel_reads: usize,
+}
+
+impl Default for Opening {
+    fn default() -> Self {
+        Self { jobs: Vec::new(), repaint: None, parallel_reads: 2 }
+    }
 }
 
 impl Opening {
@@ -31,25 +37,39 @@ impl Opening {
         self.repaint = Some(ctx);
     }
 
-    /// Start reading `path` on a worker thread.
+    /// Limit simultaneous decodes; queued paths do not retain file bytes or decoded drawings.
+    pub fn set_parallel_reads(&mut self, count: usize) {
+        self.parallel_reads = count.clamp(1, 4);
+    }
+
+    /// Queue a read. A tablet decodes one drawing at a time to bound memory peaks.
     pub fn start(&mut self, path: &str) {
-        let (tx, rx) = channel();
-        let p = path.to_string();
-        let repaint = self.repaint.clone();
-        let spawned = std::thread::Builder::new().name("cadcraft-open".into()).spawn(move || {
-            let _ = tx.send(read_file(&p));
-            if let Some(ctx) = repaint {
-                ctx.request_repaint();
-            }
-        });
-        if spawned.is_err() {
-            // No thread to read on: report it like any other failed open.
-            let (tx, rx2) = channel();
-            let _ = tx.send(Err(format!("open: {path}: could not start a reader thread")));
-            self.jobs.push(Job { path: path.to_string(), started: Instant::now(), rx: rx2 });
-            return;
+        self.jobs.push(Job { path: path.to_string(), started: Instant::now(), rx: None });
+        self.start_waiting();
+    }
+
+    fn start_waiting(&mut self) {
+        let running = self.jobs.iter().filter(|j| j.rx.is_some()).count();
+        for job in self.jobs.iter_mut().filter(|j| j.rx.is_none()).take(self.parallel_reads.saturating_sub(running)) {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            let path = job.path.clone();
+            let repaint = self.repaint.clone();
+            let spawned = std::thread::Builder::new().name("cadcraft-open".into()).spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_file(&path)))
+                    .unwrap_or_else(|_| Err(format!("open: {path}: the reader stopped unexpectedly")));
+                let _ = tx.send(result);
+                if let Some(ctx) = repaint {
+                    ctx.request_repaint();
+                }
+            });
+            job.rx = Some(if spawned.is_ok() {
+                rx
+            } else {
+                let (tx, rx) = channel();
+                let _ = tx.send(Err(format!("open: {}: could not start a reader thread", job.path)));
+                rx
+            });
         }
-        self.jobs.push(Job { path: path.to_string(), started: Instant::now(), rx });
     }
 
     /// Whether any file is still being read.
@@ -60,17 +80,18 @@ impl Opening {
     /// The finished reads, as (path, result). A reader that died without answering is an error.
     pub fn poll(&mut self) -> Vec<(String, Outcome)> {
         let mut done = Vec::new();
-        self.jobs.retain(|j| match j.rx.try_recv() {
-            Ok(r) => {
+        self.jobs.retain(|j| match j.rx.as_ref().map(Receiver::try_recv) {
+            Some(Ok(r)) => {
                 done.push((j.path.clone(), r));
                 false
             }
-            Err(TryRecvError::Empty) => true,
-            Err(TryRecvError::Disconnected) => {
+            None | Some(Err(TryRecvError::Empty)) => true,
+            Some(Err(TryRecvError::Disconnected)) => {
                 done.push((j.path.clone(), Err(format!("open: {}: the file could not be read", j.path))));
                 false
             }
         });
+        self.start_waiting();
         done
     }
 

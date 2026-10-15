@@ -104,6 +104,13 @@ public final class MainActivity extends NativeActivity {
         manager.getMemoryInfo(info);
         return Math.max(32L << 20, Math.min(256L << 20, info.availMem / 16));
     }
+    public String memoryState() {
+        ActivityManager manager = getSystemService(ActivityManager.class);
+        if (manager == null) return null;
+        ActivityManager.MemoryInfo info = new ActivityManager.MemoryInfo();
+        manager.getMemoryInfo(info);
+        return info.totalMem + "," + info.availMem + "," + info.lowMemory;
+    }
     private boolean execute(Runnable job) {
         try { files.execute(job); return true; }
         catch (RejectedExecutionException error) { notice("File operation failed", error); return false; }

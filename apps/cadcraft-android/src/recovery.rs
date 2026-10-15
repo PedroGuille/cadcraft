@@ -74,17 +74,19 @@ pub fn load(dir: PathBuf, max_bytes: u64, ctx: egui::Context) -> Result<Receiver
             let active = data.get("active").and_then(Value::as_u64).and_then(|i| usize::try_from(i).ok()).unwrap_or(0);
             let mut order: Vec<_> = (0..records.len()).collect();
             order.sort_by_key(|i| (*i != active, *i));
-            let mut remaining = max_bytes;
+            // Restore the active drawing first. Other records stay in the recovery index and
+            // are opened on demand, so background tabs cannot consume the whole session budget.
+            let remaining = max_bytes;
             for index in order {
                 let Some(record) = records.get(index) else { continue };
                 let file = record.get("file").and_then(Value::as_str).unwrap_or_default();
                 let result = load_one(&dir, &root, record, remaining);
                 match result {
-                    Ok((state, bytes)) => {
-                        remaining = remaining.saturating_sub(bytes);
+                    Ok((state, _bytes)) => {
                         if !emit(Loaded::Drawing { index, state: Box::new(state), file: file.into() }) {
                             return;
                         }
+                        break;
                     }
                     Err(error) => {
                         if !emit(Loaded::Notice(format!("Recovery: {file}: {error}; the recovery copy has been kept"))) {
@@ -94,6 +96,29 @@ pub fn load(dir: PathBuf, max_bytes: u64, ctx: egui::Context) -> Result<Receiver
                 }
             }
             emit(Loaded::Done);
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(receive)
+}
+
+/// Decode one retained recovery record selected in Drawings, without loading the other tabs.
+pub fn load_record(dir: PathBuf, index: usize, record: Value, max_bytes: u64, ctx: egui::Context) -> Result<Receiver<Loaded>, String> {
+    let (send, receive) = mpsc::sync_channel(1);
+    std::thread::Builder::new()
+        .name("tablet-restore".into())
+        .spawn(move || {
+            let root = dir.join("tablet-recovery");
+            let file = record.get("file").and_then(Value::as_str).unwrap_or_default().to_owned();
+            let event = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_one(&dir, &root, &record, max_bytes))) {
+                Ok(Ok((state, _))) => Loaded::Drawing { index, state: Box::new(state), file },
+                Ok(Err(error)) => Loaded::Notice(format!("Recovery: {error}; the recovery copy has been kept")),
+                Err(_) => Loaded::Notice("Recovery stopped unexpectedly; the recovery copy has been kept".into()),
+            };
+            if send.send(event).is_ok() {
+                ctx.request_repaint();
+                let _ = send.send(Loaded::Done);
+                ctx.request_repaint();
+            }
         })
         .map_err(|e| e.to_string())?;
     Ok(receive)
@@ -221,6 +246,7 @@ impl Writer {
             .name("tablet-recovery".into())
             .spawn(move || {
                 let mut stored = HashMap::new();
+                let mut preferences = None;
                 let mut written = Instant::now();
                 loop {
                     let Ok(mut p) = state.0.0.lock() else { break };
@@ -239,8 +265,9 @@ impl Writer {
                     p.force = false;
                     drop(p);
                     if let Some(snapshot) = snapshot {
-                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| checkpoint(&dir, snapshot, &mut stored)))
-                            .unwrap_or_else(|_| Err("The recovery writer stopped unexpectedly; previous copies were kept".into()));
+                        let result =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| checkpoint(&dir, snapshot, &mut stored, &mut preferences)))
+                                .unwrap_or_else(|_| Err("The recovery writer stopped unexpectedly; previous copies were kept".into()));
                         let _ = send.send(result);
                         ctx.request_repaint();
                         written = Instant::now();
@@ -278,7 +305,7 @@ fn sync_dir(path: &Path) -> Result<(), String> {
 }
 
 type Stored = HashMap<u64, (Arc<cadcraft_engine::doc::Drawing>, String)>;
-fn checkpoint(dir: &Path, snapshot: Snapshot, stored: &mut Stored) -> Result<(), String> {
+fn checkpoint(dir: &Path, snapshot: Snapshot, stored: &mut Stored, preferences: &mut Option<(String, String)>) -> Result<(), String> {
     let root = dir.join("tablet-recovery");
     std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_err(|e| e.to_string())?.as_nanos();
@@ -330,10 +357,14 @@ fn checkpoint(dir: &Path, snapshot: Snapshot, stored: &mut Stored) -> Result<(),
             }
         }
     }
-    atomic(
-        &dir.join("tablet-preferences.json"),
-        &serde_json::to_vec(&json!({"prefs": snapshot.prefs, "profile": snapshot.profile})).map_err(|e| e.to_string())?,
-    )?;
+    let next_preferences = (snapshot.prefs, snapshot.profile);
+    if preferences.as_ref() != Some(&next_preferences) {
+        atomic(
+            &dir.join("tablet-preferences.json"),
+            &serde_json::to_vec(&json!({"prefs": next_preferences.0, "profile": next_preferences.1})).map_err(|e| e.to_string())?,
+        )?;
+        *preferences = Some(next_preferences);
+    }
     let index_bytes = serde_json::to_vec(&json!({"active": snapshot.active, "drawings": records})).map_err(|e| e.to_string())?;
     if index_bytes.len() as u64 > MAX_INDEX {
         return Err("Recovery index is too large; the previous index was kept".into());

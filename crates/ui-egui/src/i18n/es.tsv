@@ -1304,3 +1304,6 @@ tablet	Export PDF	Exp PDF
 tablet	Share PDF	Comp PDF
 tablet	Drafting Settings	Config
 tablet	Tablet Settings	Tablet
+	Immediate pen input	Entrada inmediata del lápiz
+	Place pen points immediately; double tap to cancel remains available for fingers	Coloca puntos con el lápiz al instante; el doble toque para cancelar sigue disponible con los dedos
+	Restore drawing	Restaurar dibujo

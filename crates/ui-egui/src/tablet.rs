@@ -14,6 +14,8 @@ use crate::{
 pub struct Preferences {
     pub pen_only: bool,
     pub double_tap_cancel: bool,
+    /// Pen and mouse picks bypass the finger double-tap timer.
+    pub immediate_pen: bool,
     pub double_tap_ms: u32,
     pub barrel_cancel: bool,
     pub compact: bool,
@@ -23,7 +25,16 @@ pub struct Preferences {
 
 impl Default for Preferences {
     fn default() -> Self {
-        Self { pen_only: false, double_tap_cancel: true, double_tap_ms: 300, barrel_cancel: true, compact: false, cache_mib: 24, recovery_seconds: 5 }
+        Self {
+            pen_only: false,
+            double_tap_cancel: true,
+            immediate_pen: true,
+            double_tap_ms: 300,
+            barrel_cancel: true,
+            compact: false,
+            cache_mib: 24,
+            recovery_seconds: 5,
+        }
     }
 }
 
@@ -205,6 +216,8 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
             .show(ui.ctx(), |ui| {
                 ui.checkbox(&mut app.tablet_prefs.pen_only, crate::i18n::t("Draw with pen only"));
                 ui.checkbox(&mut app.tablet_prefs.double_tap_cancel, crate::i18n::t("Double tap to cancel"));
+                ui.checkbox(&mut app.tablet_prefs.immediate_pen, crate::i18n::t("Immediate pen input"))
+                    .on_hover_text(crate::i18n::t("Place pen points immediately; double tap to cancel remains available for fingers"));
                 ui.checkbox(&mut app.tablet_prefs.barrel_cancel, crate::i18n::t("Pen button to cancel"));
                 ui.checkbox(&mut app.tablet_prefs.compact, crate::i18n::t("Compact controls"));
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.double_tap_ms, 50..=500).text(crate::i18n::t("Double tap delay (ms)")));

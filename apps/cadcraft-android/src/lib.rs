@@ -4,6 +4,8 @@
 #[cfg(any(target_os = "android", feature = "desktop-preview"))]
 mod jobs;
 #[cfg(target_os = "android")]
+mod memory;
+#[cfg(target_os = "android")]
 mod platform;
 #[cfg(any(target_os = "android", feature = "desktop-preview"))]
 mod recovery;
@@ -17,6 +19,10 @@ pub mod shell;
 #[unsafe(no_mangle)]
 pub fn android_main(app: winit::platform::android::activity::AndroidApp) {
     android_logger::init_once(android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("CADCraft"));
+    // Leave CPU capacity for input, the compositor and bounded file/recovery workers.
+    if let Err(error) = rayon::ThreadPoolBuilder::new().num_threads(2).thread_name(|i| format!("tablet-render-{i}")).build_global() {
+        log::warn!("Could not configure tablet render workers: {error}");
+    }
     let Some(dir) = app.internal_data_path() else {
         log::error!("Android did not provide an application data directory");
         return;

@@ -30,6 +30,7 @@ cadcraft-io = { workspace = true }
 egui = { workspace = true }
 serde_json = { workspace = true }
 log = { workspace = true }
+rayon = { workspace = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { workspace = true, features = ["default_fonts", "wgpu", "persistence", "android-native-activity"] }

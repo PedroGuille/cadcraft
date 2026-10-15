@@ -118,6 +118,14 @@ pub fn sync_linked(path: &str) -> Result<(), String> {
 pub fn memory_budget() -> Result<u64, String> {
     call(|env, activity| env.call_method(activity, "memoryBudget", "()J", &[])?.j()).map(|n| n.clamp(32 << 20, 256 << 20) as u64)
 }
+pub fn memory_state() -> Result<crate::memory::State, String> {
+    let text = take("memoryState")?.ok_or("Android did not return memory information")?;
+    let mut fields = text.split(',');
+    let total = fields.next().and_then(|s| s.parse().ok()).ok_or("Invalid total memory")?;
+    let available = fields.next().and_then(|s| s.parse().ok()).ok_or("Invalid available memory")?;
+    let low = fields.next() == Some("true");
+    Ok(crate::memory::State { total, available, low })
+}
 pub fn pick_special(project: bool) -> Result<(), String> {
     call(|env, activity| env.call_method(activity, if project { "pickProject" } else { "pickLinked" }, "()V", &[]).map(|_| ()))
 }
