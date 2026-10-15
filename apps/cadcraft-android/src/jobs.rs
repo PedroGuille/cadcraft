@@ -39,16 +39,16 @@ pub struct Finished {
 
 /// Keep newer geometry dirty while retaining the format chosen by the completed save.
 pub fn acknowledge(current: &mut DocState, source: &Arc<cadcraft_engine::doc::Drawing>, saved: DocState) {
-    if Arc::ptr_eq(&current.doc, source) {
-        current.doc = saved.doc.clone();
-    } else if current.doc.header.get("ACADVER") == source.header.get("ACADVER")
-        && let Some(version) = saved.doc.header.get("ACADVER").and_then(cadcraft_engine::doc::HVal::as_str)
-        && current.doc.header.get("ACADVER").and_then(cadcraft_engine::doc::HVal::as_str) != Some(version)
+    if Arc::ptr_eq(current.drawing(), source) {
+        *current.drawing_arc_mut() = saved.drawing().clone();
+    } else if current.drawing().header.get("ACADVER") == source.header.get("ACADVER")
+        && let Some(version) = saved.drawing().header.get("ACADVER").and_then(cadcraft_engine::doc::HVal::as_str)
+        && current.drawing().header.get("ACADVER").and_then(cadcraft_engine::doc::HVal::as_str) != Some(version)
     {
-        Arc::make_mut(&mut current.doc).header.set_str("ACADVER", version);
+        Arc::make_mut(current.drawing_arc_mut()).header.set_str("ACADVER", version);
         current.revision = current.revision.saturating_add(1);
     }
-    current.saved = saved.doc;
+    current.saved = saved.saved;
     current.path = saved.path;
     current.title = saved.title;
     current.binary_dxf = saved.binary_dxf;
@@ -68,7 +68,7 @@ impl Worker {
             .spawn(move || {
                 while let Ok(job) = jobs.recv() {
                     let uid = job.state.uid;
-                    let source = job.state.doc.clone();
+                    let source = job.state.drawing().clone();
                     let action = job.action;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| execute(job)))
                         .unwrap_or_else(|_| Err("The file writer stopped unexpectedly; your drawing remains open".into()));

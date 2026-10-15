@@ -34,8 +34,6 @@ impl PointDistance for Edge {
 
 struct Geometry {
     edges: RTree<Edge>,
-    bounds: Bounds2,
-    filled: bool,
 }
 
 struct Entry {
@@ -108,16 +106,7 @@ pub(super) fn distance(d: &Drawing, e: &Entity, p: Vec2, tolerance: f64) -> Opti
                     edges.extend(poly.windows(2).filter_map(|p| Some(Edge { a: *p.first()?, b: *p.get(1)? })));
                 }
             }
-            let filled = matches!(
-                e.kind,
-                EntityKind::Text(_)
-                    | EntityKind::MText(_)
-                    | EntityKind::AttDef(_)
-                    | EntityKind::Solid(_)
-                    | EntityKind::Table(_)
-                    | EntityKind::Tolerance(_)
-            ) || matches!(&e.kind, EntityKind::Hatch(h) if h.solid);
-            let geometry = Arc::new(Geometry { edges: RTree::bulk_load(edges), bounds: cadcraft_doc::entity_bounds(d, e, 0), filled });
+            let geometry = Arc::new(Geometry { edges: RTree::bulk_load(edges) });
             // Include room for tree nodes and the retained entity, not just its edge coordinates.
             let bytes = count.saturating_mul(std::mem::size_of::<Edge>() * 4).saturating_add(std::mem::size_of::<Entry>());
             if bytes <= MAX_BYTES
@@ -141,8 +130,5 @@ pub(super) fn distance(d: &Drawing, e: &Entity, p: Vec2, tolerance: f64) -> Opti
             geometry
         }
     };
-    if geometry.filled && geometry.bounds.contains(p) {
-        return Some(0.0);
-    }
     Some(geometry.edges.nearest_neighbor(&[p.x, p.y]).map_or(f64::INFINITY, |edge| Line::new(edge.a, edge.b).dist(p)))
 }

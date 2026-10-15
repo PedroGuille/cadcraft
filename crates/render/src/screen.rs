@@ -74,8 +74,15 @@ impl Cache {
         let budget = AtomicUsize::new(used);
         let missing: Vec<_> = chunks.iter().filter(|(k, _)| !self.chunks.contains_key(k)).collect();
         let make = |&&(key, ents): &&(usize, &[Arc<Entity>])| {
-            let mut b =
-                Builder { list: DisplayList::default(), opts: &options, plotting: false, styles: None, named: None, shared_budget: Some(&budget) };
+            let mut b = Builder {
+                list: DisplayList::default(),
+                opts: &options,
+                plotting: false,
+                styles: None,
+                named: None,
+                shared_budget: Some(&budget),
+                transparency: 0,
+            };
             for e in ents {
                 if visible(drawing, e, &options) {
                     entity(&mut b, &top_ctx(drawing, Mat3::IDENTITY, e.handle, &[], &[]), e);
@@ -120,7 +127,7 @@ impl Cache {
         self.chunks = next;
         self.options = Some(options);
         self.font_revision = font_revision;
-        self.drawing = Some(drawing.clone());
+        self.drawing = Some(Arc::new((**drawing).clone()));
         Built { reused: parts.len().saturating_sub(rebuilt), rebuilt, list, parts }
     }
 }
@@ -130,6 +137,8 @@ fn same_options(a: &Options, b: &Options) -> bool {
         && a.min_dash.to_bits() == b.min_dash.to_bits()
         && a.text == b.text
         && a.fill == b.fill
+        && a.transparency == b.transparency
+        && a.skip_viewport == b.skip_viewport
         && a.lineweights == b.lineweights
         && a.view_height.to_bits() == b.view_height.to_bits()
         && a.view == b.view
@@ -148,7 +157,7 @@ fn visible(d: &Drawing, e: &Entity, o: &Options) -> bool {
         _ => return true,
     }
     let ctx = top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]);
-    let (_, lw, lt, _, _) = crate::resolve(&ctx, e, false);
+    let (_, lw, lt, _, _, _) = crate::resolve(&ctx, e, false);
     if lt.is_some_and(|l| l.pattern.iter().any(|p| p.text.is_some() || p.shape.is_some())) {
         return true;
     }

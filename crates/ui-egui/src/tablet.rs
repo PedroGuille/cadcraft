@@ -82,6 +82,12 @@ pub(crate) fn route(app: &mut CadApp, id: &str, params: &serde_json::Value) -> O
         }
         _ => return None,
     };
+    if matches!(action, FileAction::Save | FileAction::SaveAs)
+        && app.session.state().is_ok_and(|st| st.block_unsaved())
+        && let Err(e) = app.run("bsave", json!({}))
+    {
+        return Some(Err(e));
+    }
     app.tablet_file_action = Some(action);
     Some(Ok(serde_json::Value::Null))
 }

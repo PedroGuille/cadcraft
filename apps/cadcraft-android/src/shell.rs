@@ -165,9 +165,9 @@ impl Shell {
         // SAVETIME remains the user's stored setting rather than being overwritten at launch.
         cad.enable_autosave(&dir.join("autosave"));
         cad.autosave = None;
-        cad.enable_background_open_notifications(cc.egui_ctx.clone());
+        cad.opening.set_repaint_context(cc.egui_ctx.clone());
         if let Some(rs) = &cc.wgpu_render_state {
-            cad.set_wgpu(rs);
+            cad.set_wgpu(rs, None);
         }
         let writer = recovery::Writer::start(dir.clone(), cc.egui_ctx.clone())?;
         #[cfg(target_os = "android")]
@@ -290,7 +290,7 @@ impl Shell {
                 let view = d.paper_view();
                 recovery::Document {
                     uid: d.uid,
-                    drawing: d.doc.clone(),
+                    drawing: Arc::new((*d.recovery_drawing()).clone()),
                     reuse: self.restored.get(&d.uid).map(|(_, file)| file.clone()),
                     record: json!({"title": d.title, "path": d.path, "dirty": d.is_dirty(), "space": d.space, "mspace": d.mspace.map(|h| h.0),
                     "center": [view.center.x, view.center.y], "height": view.height, "binaryDxf": d.binary_dxf}),

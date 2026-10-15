@@ -8,7 +8,9 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
+pub mod animation;
 pub mod autosave;
+pub mod bedit;
 pub mod canvas;
 pub mod chrome;
 pub mod clipboard;
@@ -19,10 +21,13 @@ pub mod control;
 pub mod credits;
 pub mod dialogs;
 pub mod docking;
+pub mod hatchdlg;
+mod mtext_editor;
 pub mod spacemouse;
 // The External References palette.
 pub mod xrefs;
 
+pub mod dyngrips;
 pub mod dyninput;
 pub mod gpu;
 pub mod grip_dyn;
@@ -31,6 +36,7 @@ pub mod icons;
 pub mod layers;
 pub mod managers;
 pub mod menus;
+pub mod opening;
 pub mod options;
 pub mod palettes;
 pub mod parametric;
@@ -43,8 +49,6 @@ pub mod viewcube;
 pub mod vpscale;
 
 pub mod exchange;
-#[cfg(not(target_arch = "wasm32"))]
-mod opening;
 
 use std::sync::mpsc::Receiver;
 
@@ -56,6 +60,9 @@ pub use control::{ControlRequest, ControlResponse, PendingReply};
 
 /// The host storage key for [`CadApp::prefs_json`].
 pub const PREFS_KEY: &str = "cadcraft.prefs";
+
+/// How many recently opened drawings are kept (AutoCAD's default for its file history).
+pub const RECENT_FILES: usize = 9;
 
 /// Persisted UI state (serde, so automation can read and set it).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -92,11 +99,16 @@ pub struct UiState {
     pub history_lines: usize,
     /// Interface theme: "system" (follow the OS light/dark appearance), "light" or "dark".
     pub theme: theme::ThemePref,
+    /// Animation effects (dialog and menu fades, smoothed scrolling): "system" (follow the OS
+    /// setting), "on" or "off".
+    pub animations: animation::AnimationPref,
     /// The format Save As suggests for a drawing that has no file yet: "dxf" or "dwg".
     pub save_format: SaveFormat,
     /// The version Save As writes for a drawing that has no file yet ("2000" … "2018"); a
     /// drawing opened from a file keeps that file's version.
     pub save_version: String,
+    /// Drawings opened from a path, newest first (File ▸ Open Recent and the Start page).
+    pub recent_files: Vec<String>,
 }
 
 /// A DXF/DWG file version (2000 … 2018).
@@ -164,8 +176,10 @@ impl Default for UiState {
             dialog: None,
             history_lines: 3,
             theme: theme::ThemePref::default(),
+            animations: animation::AnimationPref::default(),
             save_format: SaveFormat::default(),
             save_version: SaveVersion::default().year().to_string(),
+            recent_files: Vec::new(),
         }
     }
 }
@@ -186,6 +200,9 @@ pub struct CadApp {
     pub tablet_file_action: Option<tablet::FileAction>,
     pub tablet_settings_open: bool,
     pub system_languages: Vec<String>,
+    /// Whether the operating system shows animations, as the host reads it; `None` when the OS
+    /// states nothing or the host cannot ask ([`animation`]).
+    pub system_animations: Option<bool>,
     pub session: Session,
     pub ui: UiState,
     /// The interface's own preferences from the Options dialog ([`options`]).
@@ -196,6 +213,8 @@ pub struct CadApp {
     pub spacemouse: spacemouse::State,
     pub cmd: cmdline::CmdLine,
     pub status: Option<(String, f64)>,
+    /// Drawings being read on worker threads ([`opening`]).
+    pub opening: opening::Opening,
     pub integrated_titlebar: bool,
     control_rx: Option<Receiver<ControlRequest>>,
     pending_shots: Vec<(u64, Option<String>, std::sync::mpsc::Sender<Value>, f64)>,
@@ -205,12 +224,14 @@ pub struct CadApp {
     /// Caps the frame rate when presenting without vsync (see [`gpu::FrameCap`]).
     #[cfg(not(target_arch = "wasm32"))]
     pub frame_cap: Option<gpu::FrameCap>,
-    /// Interface fonts installed, and whether with a CJK font (`None` until the first frame).
-    fonts_cjk: Option<bool>,
+    /// Language whose interface fonts are installed (`None` until the first frame).
+    fonts_language: Option<&'static str>,
     /// The theme last installed into egui (`None` until the first frame).
     shown_theme: Option<egui::Theme>,
     /// Whether the last applied theme was handed to egui as the System preference.
     shown_follows_system: bool,
+    /// Whether egui was last told to animate (`None` until the first frame).
+    shown_animations: Option<bool>,
     pub frame_ms: f64,
     pub quit_requested: bool,
     /// The app may close although drawings have unsaved changes (they were dealt with, or the
@@ -226,12 +247,10 @@ pub struct CadApp {
     pub gpu_faults: std::sync::Arc<gpu::GpuFaults>,
     /// The notice shown after one (see [`autosave::gpu_notice`]).
     pub gpu_notice: Option<autosave::GpuNotice>,
-    #[cfg(not(target_arch = "wasm32"))]
-    background_open: bool,
-    #[cfg(not(target_arch = "wasm32"))]
-    opening: Option<opening::Worker>,
-    #[cfg(not(target_arch = "wasm32"))]
-    open_repaint: Option<egui::Context>,
+    /// The Hatch and Gradient dialog while open or picking ([`hatchdlg`]).
+    pub hatch_dlg: Option<hatchdlg::HatchDlgState>,
+    /// The Edit Block Definition dialog ([`bedit`]).
+    pub bedit: bedit::State,
 }
 
 impl CadApp {
@@ -243,6 +262,7 @@ impl CadApp {
             tablet_file_action: None,
             tablet_settings_open: false,
             system_languages: Vec::new(),
+            system_animations: None,
             session,
             ui: UiState::default(),
             options: options::UiOptions::default(),
@@ -251,6 +271,7 @@ impl CadApp {
             spacemouse: spacemouse::State::default(),
             cmd: cmdline::CmdLine::default(),
             status: None,
+            opening: opening::Opening::default(),
             integrated_titlebar: false,
             control_rx: None,
             pending_shots: Vec::new(),
@@ -259,9 +280,10 @@ impl CadApp {
             synthetic: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             frame_cap: None,
-            fonts_cjk: None,
+            fonts_language: None,
             shown_theme: None,
             shown_follows_system: false,
+            shown_animations: None,
             frame_ms: 0.0,
             quit_requested: false,
             quit_confirmed: false,
@@ -270,26 +292,25 @@ impl CadApp {
             recovery: autosave::Recovery::default(),
             gpu_faults: std::sync::Arc::default(),
             gpu_notice: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            background_open: false,
-            #[cfg(not(target_arch = "wasm32"))]
-            opening: None,
-            #[cfg(not(target_arch = "wasm32"))]
-            open_repaint: None,
+            hatch_dlg: None,
+            bedit: bedit::State::default(),
         }
     }
 
     /// The interface language shown: the chosen one, or English when this computer has no font
-    /// for it (Chinese without an installed CJK font would be boxes).
+    /// for it (Chinese or Korean without a suitable font would be boxes).
     pub fn language(&self) -> &'static str {
         let l = self.ui.interface_language.resolve(&self.system_languages);
         if theme::can_show(l) { l } else { "en" }
     }
 
     /// Draw the canvas on the GPU with the app's wgpu render state (eframe's
-    /// `CreationContext::wgpu_render_state`). Without it the canvas draws on the CPU.
-    pub fn set_wgpu(&mut self, rs: &egui_wgpu::RenderState) {
-        self.canvas.gpu = Some(gpu::install(rs, &self.gpu_faults));
+    /// `CreationContext::wgpu_render_state`). Without it the canvas draws on the CPU. `stencil`:
+    /// the format of the render pass's stencil buffer when the app asked for one (eframe
+    /// `NativeOptions::stencil_buffer`); clipped viewports are clipped with it.
+    pub fn set_wgpu(&mut self, rs: &egui_wgpu::RenderState, stencil: Option<egui_wgpu::wgpu::TextureFormat>) {
+        self.canvas.gpu = Some(gpu::install(rs, &self.gpu_faults, stencil));
+        self.canvas.gpu_device = Some(rs.device.clone());
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
@@ -332,7 +353,7 @@ impl CadApp {
     /// Submit a line of command-line text. A refused line is echoed to the history; the error is
     /// also returned.
     pub fn cmdline(&mut self, text: &str) -> Option<String> {
-        if self.session.running.is_none() {
+        if !self.session.prompting() {
             let first = text.split_whitespace().next().unwrap_or("");
             // `cmd {json}` is a programmatic call: the engine runs it with those parameters.
             let json_form = text.trim_start().get(first.len()..).is_some_and(|rest| rest.trim_start().starts_with('{'));
@@ -353,10 +374,17 @@ impl CadApp {
         self.shown_theme.unwrap_or_else(|| self.ui.theme.resolve(None))
     }
 
+    /// Whether the interface shows animation effects now (the choice resolved against the OS
+    /// setting).
+    pub fn shows_animations(&self) -> bool {
+        self.ui.animations.resolve(self.system_animations)
+    }
+
     /// Preferences kept across restarts, as JSON for the host's storage ([`PREFS_KEY`]).
     pub fn prefs_json(&self) -> String {
         let mut prefs = json!({
             "theme": self.ui.theme.as_str(),
+            "animations": self.ui.animations.as_str(),
             "interfaceLanguage": self.ui.interface_language.code(),
             "saveFormat": self.ui.save_format.as_str(),
             "saveVersion": self.ui.save_version,
@@ -366,6 +394,9 @@ impl CadApp {
         }
         if self.tablet_mode {
             prefs["tablet"] = json!(self.tablet_prefs);
+        }
+        if !self.ui.recent_files.is_empty() {
+            prefs["recentFiles"] = json!(self.ui.recent_files);
         }
         prefs.to_string()
     }
@@ -385,6 +416,9 @@ impl CadApp {
         if let Some(t) = v.get("theme").and_then(Value::as_str).and_then(theme::ThemePref::parse) {
             self.ui.theme = t;
         }
+        if let Some(a) = v.get("animations").and_then(Value::as_str).and_then(animation::AnimationPref::parse) {
+            self.ui.animations = a;
+        }
         if let Some(l) = v.get("interfaceLanguage").and_then(Value::as_str).and_then(i18n::Preference::parse) {
             self.ui.interface_language = l;
         }
@@ -394,20 +428,59 @@ impl CadApp {
         if let Some(v) = v.get("saveVersion").and_then(Value::as_str).and_then(SaveVersion::parse) {
             self.ui.save_version = v.year().to_string();
         }
+        if let Some(files) = v.get("recentFiles").and_then(Value::as_array) {
+            self.ui.recent_files = files.iter().filter_map(Value::as_str).filter(|p| !p.is_empty()).take(RECENT_FILES).map(str::to_string).collect();
+        }
     }
 
     pub fn set_status(&mut self, s: impl Into<String>) {
         self.status = Some((s.into(), now_ms()));
     }
 
+    /// Open the drawing at `path`. Natively the file is read on a worker thread while an
+    /// "Opening ..." card shows ([`opening`]); [`Self::finish_opening`] adds it when ready. On the
+    /// web it opens at once.
     pub fn open_path(&mut self, path: &str) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.background_open {
-            self.queue_open(path);
+        // A LISP file (dropped on the window): loaded as APPLOAD loads it.
+        if is_lisp_file(path) {
+            match cadcraft_engine::lisp::builtins::read_text_file(path) {
+                Some(text) => self.load_lisp(path, &text),
+                None => self.open_failed(format!("APPLOAD: can't read {path}")),
+            }
             return;
         }
-        let r = self.run("open", json!({ "path": path }));
-        self.opened(r);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.opening.start(path);
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let r = self.run("open", json!({ "path": path }));
+            self.opened(r);
+        }
+    }
+
+    /// Add the files whose background read has finished; report the ones that failed as a failed
+    /// OPEN is reported. Called every frame.
+    pub fn finish_opening(&mut self) {
+        for (_, outcome) in self.opening.poll() {
+            let r = match outcome {
+                Ok(f) => self.session.finish_open(f).map_err(|e| e.to_string()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = &r {
+                self.session.echo(e.clone());
+            }
+            self.opened(r);
+        }
+    }
+
+    /// Load a LISP file: its routine runs and may wait for the user (APPLOAD typed or from the
+    /// menu runs this way too).
+    fn load_lisp(&mut self, name: &str, text: &str) {
+        if let Err(e) = self.session.lisp_load(name, text, false) {
+            self.session.echo(e.to_string());
+        }
     }
 
     /// The largest file [`Self::open_bytes`] opens. A drawing opened from its contents (the
@@ -433,6 +506,9 @@ impl CadApp {
         if let Some(e) = Self::open_size_error(name, bytes.len() as u64) {
             return self.open_failed(e);
         }
+        if is_lisp_file(name) {
+            return self.load_lisp(name, &String::from_utf8_lossy(bytes));
+        }
         let data = cadcraft_engine::cmd::file::base64_encode(bytes);
         let r = self.run("open", json!({ "data": data, "name": name }));
         self.opened(r);
@@ -447,26 +523,51 @@ impl CadApp {
     }
 
     fn opened(&mut self, r: Result<Value, String>) {
-        if let Err(e) = r {
-            self.set_status(e);
-        } else {
-            self.ui.start_tab = false;
-            self.canvas.zoom_pending = true;
+        match r {
+            Err(e) => self.set_status(e),
+            Ok(v) => {
+                self.ui.start_tab = false;
+                self.canvas.zoom_pending = true;
+                let doc = v.get("index").and_then(Value::as_u64).and_then(|i| self.session.docs.get(usize::try_from(i).ok()?));
+                if let Some(path) = doc.and_then(|d| d.path.clone()) {
+                    self.remember_recent(path);
+                }
+                // A partial read (DWG records left out) shows in the status bar too, not only on
+                // the command line.
+                if let Some(w) = v.get("warnings").and_then(Value::as_array).and_then(|w| w.first()).and_then(Value::as_str) {
+                    self.set_status(w.to_string());
+                }
+                // A dynamic block's own drawing: ask whether to open it in the Block Editor.
+                if self.session.state().is_ok_and(|st| cadcraft_engine::blockedit::has_authoring_elements(&st.doc)) {
+                    self.ui.dialog = Some("authoring".into());
+                }
+            }
         }
+    }
+
+    /// Put `path` first in File ▸ Open Recent and on the Start page.
+    fn remember_recent(&mut self, path: String) {
+        let recent = &mut self.ui.recent_files;
+        recent.retain(|p| *p != path);
+        recent.insert(0, path);
+        recent.truncate(RECENT_FILES);
     }
 
     /// Per-frame logic before layout.
     pub fn logic(&mut self, ctx: &egui::Context) {
-        #[cfg(not(target_arch = "wasm32"))]
-        self.open_tick(ctx);
+        // A long LISP routine runs a slice per frame, so the window stays live (and Esc stops it).
+        self.session.lisp_tick();
+        if self.session.lisp_busy() {
+            ctx.request_repaint();
+        }
         // Closing the window (title bar, File ▸ Exit, Cmd+Q) with unsaved changes asks first.
         if ctx.input(|i| i.viewport().close_requested()) && self.request_quit() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
-        let cjk = self.language().starts_with("zh");
-        if self.fonts_cjk != Some(cjk) {
-            theme::install_fonts(ctx, cjk);
-            self.fonts_cjk = Some(cjk);
+        let language = self.language();
+        if self.fonts_language != Some(language) {
+            theme::install_fonts(ctx, language);
+            self.fonts_language = Some(language);
         }
         // Resolved every frame, so a System choice follows the OS appearance live (winit and the
         // browser report changes as input); the saved choice itself never changes here.
@@ -485,7 +586,18 @@ impl CadApp {
                 style.spacing.button_padding = egui::vec2(4.0, 4.0);
             });
         }
+        // Resolved every frame too, so a System choice follows the OS setting live.
+        let animate = self.shows_animations();
+        if self.shown_animations != Some(animate) {
+            animation::apply(ctx, animate);
+            self.shown_animations = Some(animate);
+        }
+        if !animate {
+            animation::unsmooth_scroll(ctx);
+        }
         self.drain_control(ctx);
+        self.finish_opening();
+        self.opening.show(ctx);
         if !self.synthetic.is_empty() {
             ctx.request_repaint();
         }
@@ -493,6 +605,7 @@ impl CadApp {
         self.issue_screenshots(ctx);
         self.gpu_fault_tick(ctx);
         managers::plot_window_resume(self, ctx);
+        hatchdlg::resume(self);
         self.autosave_tick(ctx);
         menus::shortcuts(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
@@ -595,9 +708,12 @@ impl CadApp {
 
     fn issue_screenshots(&mut self, ctx: &egui::Context) {
         let now = now_ms();
+        // Wait for a background rebuild for the current view, so the shot shows the drawing at
+        // that view, but not past the reply's deadline.
+        let building = self.canvas.building();
         self.queued_shots.retain_mut(|(token, at, frames)| {
             *frames += 1;
-            if now >= *at && *frames >= 3 {
+            if now >= *at && *frames >= 3 && (!building || now >= *at + SHOT_REBUILD_WAIT_MS) {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(*token)));
                 false
             } else {
@@ -643,6 +759,10 @@ impl CadApp {
     }
 }
 
+/// How long a control-channel screenshot waits for a background rebuild before it is taken
+/// anyway (the reply itself times out after 8 s).
+const SHOT_REBUILD_WAIT_MS: f64 = 6000.0;
+
 pub fn now_ms() -> f64 {
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -653,6 +773,11 @@ pub fn now_ms() -> f64 {
     {
         0.0
     }
+}
+
+/// A LISP source file, by its name.
+fn is_lisp_file(name: &str) -> bool {
+    std::path::Path::new(name).extension().is_some_and(|e| e.eq_ignore_ascii_case("lsp"))
 }
 
 #[cfg(test)]
@@ -712,7 +837,7 @@ mod tests {
         frame(&mut a, &ctx, None);
         assert_eq!(Tokens::get(), Tokens::of(theme::SYSTEM_FALLBACK), "no OS appearance: the documented fallback");
         assert_eq!(a.ui.theme, ThemePref::System);
-        assert_eq!(a.prefs_json(), r#"{"interfaceLanguage":"auto","saveFormat":"dxf","saveVersion":"2018","theme":"system"}"#);
+        assert_eq!(a.prefs_json(), r#"{"animations":"system","interfaceLanguage":"auto","saveFormat":"dxf","saveVersion":"2018","theme":"system"}"#);
     }
 
     #[test]
