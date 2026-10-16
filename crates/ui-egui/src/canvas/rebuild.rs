@@ -9,8 +9,8 @@
 //! builds the new one. A view that needs a different list cancels the build in flight (dropping
 //! its [`Job`] sets the build's cancel flag, see `cadcraft_render::Options::cancel`) and starts
 //! one for itself, so a long scroll through many zoom bands builds only for where it stops.
-//! Edits still rebuild at once, so a change is never drawn late. The web build has no threads and
-//! rebuilds synchronously.
+//! Expensive edits use the same worker; canvas picks wait for their matching scene. Small edits
+//! remain immediate. The web build has no threads and rebuilds synchronously.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +19,8 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use cadcraft_color::Rgb;
 use cadcraft_doc::{Drawing, Space};
 use cadcraft_geom::{Bounds2, Vec2};
-use cadcraft_render::{DisplayList, Kind, Options};
+use cadcraft_render::screen::{Cache, Geometry, Scene};
+use cadcraft_render::{Kind, Options};
 
 /// What a build needs: the drawing (shared, never copied), the space and the options.
 pub(super) struct Request {
@@ -28,6 +29,7 @@ pub(super) struct Request {
     pub opts: Options,
     /// Also convert the list to GPU vertex data (GPU canvas only).
     pub mesh: Option<MeshRequest>,
+    pub cache: Cache,
 }
 
 /// How to convert the list for the GPU: the view the vertex origin is chosen for and the
@@ -41,11 +43,16 @@ pub(super) struct MeshRequest {
     /// Create the GPU buffers on the worker too, so the frame that swaps the list in only swaps
     /// buffers (`None`: the paint callback uploads them).
     pub device: Option<egui_wgpu::wgpu::Device>,
+    pub parts: std::collections::HashMap<u64, Arc<crate::gpu::MeshData>>,
 }
 
 /// A finished build.
 pub(super) struct Built {
-    pub list: DisplayList,
+    pub list: Scene,
+    pub cache: Cache,
+    pub source: Arc<Drawing>,
+    pub rebuilt: usize,
+    pub reused: usize,
     pub build_ms: f64,
     pub mesh: Option<BuiltMesh>,
 }
@@ -100,12 +107,13 @@ impl Job {
 
 /// Build `req` on the calling thread; `None` once it has been cancelled (the partial list is
 /// thrown away, and no vertex data is made for it).
-fn run(req: Request) -> Option<Built> {
+fn run(mut req: Request) -> Option<Built> {
     if req.opts.cancelled() {
         return None;
     }
     let t0 = crate::now_ms();
-    let list = cadcraft_render::build(&req.doc, &req.space, &req.opts);
+    let built = req.cache.build_scene(&req.doc, &req.space, &req.opts);
+    let list = built.scene;
     if req.opts.cancelled() {
         return None;
     }
@@ -114,20 +122,31 @@ fn run(req: Request) -> Option<Built> {
         None => None,
         Some(m) => {
             let t1 = crate::now_ms();
-            let origin = crate::gpu::choose_origin(&list.bounds, m.view_center, m.view_height);
+            let origin = crate::gpu::choose_origin(req.opts.view.as_ref().unwrap_or(&list.bounds), m.view_center, m.view_height);
             let bg = if list.sheet.is_some() { m.paper_bg } else { m.model_bg };
-            let mut data = crate::gpu::build_mesh(&list, origin, bg, m.lwdisplay);
+            let mut data = crate::gpu::MeshData::default();
+            for part in &list.parts {
+                if req.opts.cancelled() {
+                    return None;
+                }
+                let id = super::part_mesh_key(part.id, origin, bg, m.lwdisplay);
+                let mesh = m.parts.get(&id).cloned().unwrap_or_else(|| {
+                    let mut mesh = crate::gpu::build_mesh(&part.list, origin, bg, m.lwdisplay);
+                    if let Some(device) = &m.device {
+                        mesh.upload_now(device);
+                    }
+                    Arc::new(mesh)
+                });
+                data.parts.push((id, mesh));
+            }
             if req.opts.cancelled() {
                 return None;
             }
-            if let Some(device) = &m.device {
-                data.upload_now(device);
-            }
-            let infinite = list.prims.iter().enumerate().filter(|(_, p)| matches!(p.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+            let infinite = list.primitives().enumerate().filter(|(_, (_, p))| matches!(p.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
             Some(BuiltMesh { data, origin, bg, lwdisplay: m.lwdisplay, infinite, ms: crate::now_ms() - t1 })
         }
     };
-    Some(Built { list, build_ms, mesh })
+    Some(Built { list, build_ms, mesh, cache: req.cache, source: Arc::new((*req.doc).clone()), rebuilt: built.rebuilt, reused: built.reused })
 }
 
 // A single worker keeps one active build and only the latest pending view. Replacing a
@@ -222,6 +241,7 @@ mod tests {
             doc: doc.clone(),
             space: Space::Model,
             opts: opts.clone(),
+            cache: Cache::default(),
             mesh: Some(MeshRequest {
                 view_center: Vec2::ZERO,
                 view_height: 20.0,
@@ -229,6 +249,7 @@ mod tests {
                 paper_bg: Rgb(255, 255, 255),
                 lwdisplay: false,
                 device: None,
+                parts: Default::default(),
             }),
         };
         let ctx = egui::Context::default();
@@ -240,17 +261,17 @@ mod tests {
                 Poll::Lost => panic!("worker lost"),
             }
         };
-        assert_eq!(built.list.prims.len(), sync.prims.len());
-        assert_eq!(built.list.verts, sync.verts);
+        assert_eq!(built.list.primitive_count(), sync.prims.len());
+        assert_eq!(built.list.flatten().verts, sync.verts);
         let Some(mesh) = built.mesh else { panic!("no mesh") };
         assert_eq!(mesh.bg, Rgb(0, 0, 0));
-        assert!(mesh.data.line_vertices() >= 2);
+        assert!(mesh.data.parts.iter().map(|(_, m)| m.line_vertices()).sum::<usize>() >= 2);
     }
 
     #[test]
     fn cancelled_run_makes_nothing() {
         let opts = Options { cancel: Some(Arc::new(AtomicBool::new(true))), ..Default::default() };
-        let req = Request { doc: Arc::new(Drawing::new_imperial()), space: Space::Model, opts, mesh: None };
+        let req = Request { doc: Arc::new(Drawing::new_imperial()), space: Space::Model, opts, mesh: None, cache: Cache::default() };
         assert!(run(req).is_none());
     }
 

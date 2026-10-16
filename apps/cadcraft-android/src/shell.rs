@@ -596,7 +596,11 @@ impl Shell {
         if force || self.cache_mib != mib {
             self.cache_mib = mib;
             let gpu = mib / 4;
-            self.cad.canvas.set_cache_budget(((mib - gpu) as usize) << 20);
+            let spatial = mib / 4;
+            let snap = (mib / 8).min(2);
+            self.cad.session.set_snap_cache_budget((snap as usize) << 20);
+            cadcraft_engine::spatial::set_cache_budget((spatial as usize) << 20);
+            self.cad.canvas.set_cache_budget(((mib - gpu - spatial - snap) as usize) << 20);
             if let Some(rs) = &self.render {
                 cadcraft_ui_egui::gpu::set_cache_budget(rs, gpu);
             }

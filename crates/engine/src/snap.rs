@@ -1,5 +1,6 @@
 //! Object snaps (OSNAP), polar tracking and ortho.
 
+pub(crate) mod cache;
 mod curves;
 pub mod iso;
 pub mod tracking;
@@ -255,12 +256,28 @@ fn osnap_in_with_prims(
     frozen: &[String],
     clip: Option<Bounds2>,
 ) -> Option<(Option<SnapHit>, Vec<Prim>)> {
-    let (mut cands, near_prims) = gather_in(d, space, ix, cursor, aperture, osmode, frozen)?;
+    let (cands, near_prims) = gather_in(d, space, ix, cursor, aperture, osmode, frozen)?;
+    let hit = resolve_neighborhood(cands, &near_prims, None, cursor, aperture, osmode, base, deferred, clip);
+    Some((hit, near_prims))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_neighborhood(
+    mut cands: Vec<(u32, Vec2)>,
+    near_prims: &[Prim],
+    segments: Option<&[Vec<Segment>]>,
+    cursor: Vec2,
+    aperture: f64,
+    osmode: u32,
+    base: Option<Vec2>,
+    deferred: bool,
+    clip: Option<Bounds2>,
+) -> Option<SnapHit> {
     // Intersections between nearby primitives; Apparent Intersection also where their extensions
     // meet (lines extended, arcs as full circles: in 2D, the "apparent" crossing of objects
     // that don't reach each other).
     if osmode & (mode::INT | mode::APP) != 0 {
-        let mut segs: Vec<Vec<Segment>> = near_prims.iter().take(200).map(prim_segments).collect();
+        let mut segs: Vec<Vec<Segment>> = segments.map_or_else(|| near_prims.iter().take(200).map(prim_segments).collect(), |s| s.to_vec());
         let probe = finite_intersection_probe(cursor, aperture);
         for (i, segments) in segs.iter_mut().enumerate() {
             let preserves_app = osmode & mode::APP != 0 && near_prims.get(i).is_some_and(extendable);
@@ -292,8 +309,7 @@ fn osnap_in_with_prims(
             }
         }
     }
-    let hit = finish(cands, &near_prims, cursor, aperture, osmode, base, deferred, clip);
-    Some((hit, near_prims))
+    finish(cands, near_prims, cursor, aperture, osmode, base, deferred, clip)
 }
 
 fn finite_intersection_probe(cursor: Vec2, aperture: f64) -> Option<Bounds2> {

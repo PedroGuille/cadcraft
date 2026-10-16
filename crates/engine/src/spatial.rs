@@ -25,26 +25,28 @@ pub const MIN_INDEXED: usize = 256;
 /// Indexes kept alive (open drawings × spaces, plus a few undo states).
 const CACHE_SIZE: usize = 4;
 
-/// Tree items carry (chunk serial, index within the chunk); draw indices are derived at query
-/// time so inserting or removing entities never invalidates other chunks' items.
-type Item = GeomWithData<Rectangle<[f64; 2]>, (u32, u32)>;
-
-static NEXT_SERIAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// A small immutable tree per entity chunk, plus a tree over chunk envelopes. Updating one
+/// chunk never clones the tree of every entity in the drawing.
+type Item = GeomWithData<Rectangle<[f64; 2]>, u32>;
+type ChunkItem = GeomWithData<Rectangle<[f64; 2]>, usize>;
 
 /// One store chunk's entities and bounds, shared between successive indexes while unchanged.
 struct ChunkIx {
-    serial: u32,
     key: usize,
     ents: Vec<Arc<Entity>>,
     bounds: Vec<Bounds2>,
     /// Local indices of xlines and rays (unbounded; always candidates for pick and crossing).
     infinite: Vec<u32>,
+    tree: RTree<Item>,
+    envelope: Bounds2,
+    /// Invalid/unbounded bounds are never culled by the tree.
+    unbounded: Vec<u32>,
 }
 
 impl ChunkIx {
     fn build(d: &Drawing, key: usize, items: &[Arc<Entity>]) -> ChunkIx {
         let mut infinite = Vec::new();
-        let bounds = items
+        let bounds: Vec<_> = items
             .iter()
             .enumerate()
             .map(|(i, e)| {
@@ -54,13 +56,36 @@ impl ChunkIx {
                 entity_bounds(d, e, 0)
             })
             .collect();
-        let serial = NEXT_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ChunkIx { serial, key, ents: items.to_vec(), bounds, infinite }
+        let mut envelope = Bounds2::EMPTY;
+        let mut unbounded = Vec::new();
+        let tree = RTree::bulk_load(
+            bounds
+                .iter()
+                .enumerate()
+                .filter_map(|(i, b)| {
+                    let i = u32::try_from(i).ok()?;
+                    if b.is_empty() {
+                        return None;
+                    }
+                    if !b.min.is_finite() || !b.max.is_finite() {
+                        unbounded.push(i);
+                        return None;
+                    }
+                    envelope = envelope.union(b);
+                    Some(GeomWithData::new(Rectangle::from_corners([b.min.x, b.min.y], [b.max.x, b.max.y]), i))
+                })
+                .collect(),
+        );
+        ChunkIx { key, ents: items.to_vec(), bounds, infinite, tree, envelope, unbounded }
     }
-    fn items(&self) -> impl Iterator<Item = Item> + '_ {
-        self.bounds.iter().enumerate().filter(|(_, b)| !b.is_empty()).map(|(i, b)| {
-            GeomWithData::new(Rectangle::from_corners([b.min.x, b.min.y], [b.max.x, b.max.y]), (self.serial, u32::try_from(i).unwrap_or(u32::MAX)))
-        })
+
+    fn bytes(&self) -> usize {
+        self.ents
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Arc<Entity>>())
+            .saturating_add(self.bounds.capacity().saturating_mul(std::mem::size_of::<Bounds2>()))
+            .saturating_add(self.tree.size().saturating_mul(std::mem::size_of::<Item>().saturating_mul(2)))
+            .saturating_add((self.infinite.capacity() + self.unbounded.capacity()).saturating_mul(std::mem::size_of::<u32>()))
     }
 }
 
@@ -77,9 +102,8 @@ pub struct SpatialIndex {
     hidden_layers: Vec<String>,
     /// (draw index of the chunk's first entity, chunk), in draw order.
     chunks: Vec<(u32, Arc<ChunkIx>)>,
-    /// Chunk serial → draw offset.
-    offsets: std::collections::HashMap<u32, u32>,
-    tree: RTree<Item>,
+    tree: RTree<ChunkItem>,
+    unbounded: Vec<u32>,
     /// Draw indices of xlines and rays.
     infinite: Vec<u32>,
     len: usize,
@@ -107,45 +131,31 @@ impl SpatialIndex {
         let old: std::collections::HashMap<usize, Arc<ChunkIx>> =
             prev.map(|p| p.chunks.iter().map(|(_, c)| (c.key, c.clone())).collect()).unwrap_or_default();
         let mut chunks = Vec::new();
-        let mut fresh = Vec::new();
-        let mut kept = std::collections::HashSet::new();
         let mut offset = 0u32;
         for (key, items) in store.chunk_slices() {
             let c = match old.get(&key) {
-                Some(c) if c.ents.len() == items.len() => {
-                    kept.insert(c.serial);
-                    c.clone()
-                }
-                _ => {
-                    let c = Arc::new(ChunkIx::build(d, key, items));
-                    fresh.push(c.clone());
-                    c
-                }
+                Some(c) if c.ents.len() == items.len() => c.clone(),
+                _ => Arc::new(ChunkIx::build(d, key, items)),
             };
             let n = u32::try_from(c.ents.len()).unwrap_or(u32::MAX);
             chunks.push((offset, c));
             offset = offset.saturating_add(n);
         }
-        // Patch the previous tree when most of it survives; otherwise bulk-load.
-        let tree = match prev {
-            Some(p) if kept.len() * 2 >= chunks.len().max(1) => {
-                let mut tree = p.tree.clone();
-                for (_, c) in p.chunks.iter().filter(|(_, c)| !kept.contains(&c.serial)) {
-                    for it in c.items() {
-                        tree.remove(&it);
-                    }
-                }
-                for c in &fresh {
-                    for it in c.items() {
-                        tree.insert(it);
-                    }
-                }
-                tree
-            }
-            _ => RTree::bulk_load(chunks.iter().flat_map(|(_, c)| c.items()).collect()),
-        };
-        let offsets = chunks.iter().map(|(off, c)| (c.serial, *off)).collect();
+        // Only the top level is rebuilt: one rectangle per chunk, not per entity. The local
+        // trees and their measured bounds are shared across edits and undo snapshots.
+        let tree = RTree::bulk_load(
+            chunks
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, c))| !c.envelope.is_empty())
+                .map(|(i, (_, c))| {
+                    let b = c.envelope;
+                    GeomWithData::new(Rectangle::from_corners([b.min.x, b.min.y], [b.max.x, b.max.y]), i)
+                })
+                .collect(),
+        );
         let infinite = chunks.iter().flat_map(|(off, c)| c.infinite.iter().map(move |i| off + i)).collect();
+        let unbounded = chunks.iter().flat_map(|(off, c)| c.unbounded.iter().map(move |i| off + i)).collect();
         SpatialIndex {
             store: store.clone(),
             blocks: d.blocks.clone(),
@@ -154,8 +164,8 @@ impl SpatialIndex {
             anno: anno_key(d),
             hidden_layers: hidden_layers(d).map(str::to_owned).collect(),
             chunks,
-            offsets,
             tree,
+            unbounded,
             infinite,
             len: offset as usize,
         }
@@ -179,6 +189,14 @@ impl SpatialIndex {
     }
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+    /// Conservative retained allocation estimate; shared chunks may be counted more than once.
+    pub fn bytes(&self) -> usize {
+        self.chunks
+            .iter()
+            .fold(0usize, |n, (_, c)| n.saturating_add(c.bytes()))
+            .saturating_add(self.tree.size().saturating_mul(std::mem::size_of::<ChunkItem>().saturating_mul(2)))
+            .saturating_add((self.infinite.capacity() + self.unbounded.capacity()).saturating_mul(std::mem::size_of::<u32>()))
     }
     fn locate(&self, i: u32) -> Option<(&ChunkIx, usize)> {
         let pos = self.chunks.partition_point(|(off, _)| *off <= i).checked_sub(1)?;
@@ -207,8 +225,12 @@ impl SpatialIndex {
         // Pad a little so rounding in the callers' own predicates never loses a candidate.
         let pad = (b.width() + b.height()) * 1e-9 + (b.min.x.abs() + b.min.y.abs() + b.max.x.abs() + b.max.y.abs()) * 1e-12 + 1e-300;
         let env = AABB::from_corners([b.min.x - pad, b.min.y - pad], [b.max.x + pad, b.max.y + pad]);
-        let mut out: Vec<u32> =
-            self.tree.locate_in_envelope_intersecting(&env).filter_map(|it| self.offsets.get(&it.data.0).map(|off| off + it.data.1)).collect();
+        let mut out = self.unbounded.clone();
+        for item in self.tree.locate_in_envelope_intersecting(&env) {
+            if let Some((off, chunk)) = self.chunks.get(item.data) {
+                out.extend(chunk.tree.locate_in_envelope_intersecting(&env).map(|it| off + it.data));
+            }
+        }
         if with_infinite {
             out.extend_from_slice(&self.infinite);
         }
@@ -219,6 +241,24 @@ impl SpatialIndex {
 }
 
 static CACHE: Mutex<Vec<Arc<SpatialIndex>>> = Mutex::new(Vec::new());
+static CACHE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 20);
+
+fn trim(cache: &mut Vec<Arc<SpatialIndex>>) {
+    let limit = CACHE_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+    // Keep the current accelerator. The allowance is for older drawing/undo indexes, just as
+    // the renderer's allowance excludes geometry required for the current frame.
+    while cache.len() > 1
+        && (cache.len() > CACHE_SIZE || cache.iter().take(cache.len() - 1).fold(0usize, |n, ix| n.saturating_add(ix.bytes())) > limit)
+    {
+        cache.remove(0);
+    }
+}
+
+/// Bound inactive spatial indexes as part of the tablet's session memory allowance.
+pub fn set_cache_budget(bytes: usize) {
+    CACHE_BYTES.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    trim(&mut CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+}
 
 /// The cached index for a space, building it when the space changed. `None` when the space
 /// doesn't exist or is small enough to scan directly.
@@ -237,6 +277,7 @@ pub fn index_store(d: &Drawing, store: &EntityStore) -> Arc<SpatialIndex> {
         if let Some(pos) = cache.iter().position(|ix| ix.matches(d, store)) {
             let ix = cache.remove(pos);
             cache.push(ix.clone());
+            trim(&mut cache);
             return ix;
         }
     }
@@ -246,10 +287,8 @@ pub fn index_store(d: &Drawing, store: &EntityStore) -> Arc<SpatialIndex> {
     let ix = Arc::new(SpatialIndex::build_from(d, store, prev.as_deref()));
     let mut cache = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Drop entries whose store this one supersedes cheaply: keep the most recent ones.
-    while cache.len() >= CACHE_SIZE {
-        cache.remove(0);
-    }
     cache.push(ix.clone());
+    trim(&mut cache);
     ix
 }
 

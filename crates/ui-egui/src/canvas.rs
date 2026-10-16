@@ -6,6 +6,7 @@ use cadcraft_doc::Handle;
 use cadcraft_engine::Input;
 use cadcraft_engine::snap::{self, SnapHit};
 use cadcraft_geom::{Bounds2, Vec2};
+use cadcraft_render::screen::Geometry;
 use cadcraft_render::{DisplayList, Kind};
 use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
 use std::collections::{HashMap, VecDeque};
@@ -48,14 +49,13 @@ fn same_content(a: &ListKey, b: &ListKey) -> bool {
 
 #[derive(Default)]
 pub struct CanvasState {
-    pub list: Option<DisplayList>,
+    pub list: Option<cadcraft_render::screen::Scene>,
     key: ListKey,
     space: cadcraft_doc::Space,
     source: Option<Arc<cadcraft_doc::Drawing>>,
     render_cache: cadcraft_render::screen::Cache,
     /// Shared CPU cache allowance supplied by the tablet host.
     cache_limit: Option<usize>,
-    parts: Vec<cadcraft_render::screen::Part>,
     scenes: VecDeque<Scene>,
     part_meshes: HashMap<u64, Arc<crate::gpu::MeshData>>,
     selection: Selection,
@@ -160,15 +160,14 @@ struct Scene {
     key: ListKey,
     space: cadcraft_doc::Space,
     source: Arc<cadcraft_doc::Drawing>,
-    list: DisplayList,
+    list: cadcraft_render::screen::Scene,
     window: Option<Bounds2>,
     cache: cadcraft_render::screen::Cache,
-    parts: Vec<cadcraft_render::screen::Part>,
 }
 
 impl Scene {
     fn bytes(&self) -> usize {
-        cadcraft_render::screen::bytes(&self.list).saturating_add(self.cache.bytes())
+        self.list.bytes().saturating_add(self.cache.bytes())
     }
 }
 
@@ -205,9 +204,6 @@ impl CanvasState {
         let Some(limit) = self.cache_limit else { return };
         let half = limit / 2;
         self.render_cache.set_budget(half);
-        if self.parts.iter().map(|p| cadcraft_render::screen::bytes(&p.list)).sum::<usize>() > half {
-            self.parts.clear();
-        }
         let mut mesh_bytes = 0usize;
         self.part_meshes.retain(|_, mesh| {
             let bytes = mesh.cpu_bytes();
@@ -326,7 +322,6 @@ impl CanvasState {
         self.vp_sel = VpHighlight::default();
         self.source = None;
         self.render_cache = Default::default();
-        self.parts.clear();
         self.scenes.clear();
         self.part_meshes.clear();
         self.window = None;
@@ -363,7 +358,14 @@ impl CanvasState {
     /// Put a finished background build in place, with its GPU vertex data when it has some.
     fn install(&mut self, key: ListKey, window: Option<Bounds2>, built: rebuild::Built) {
         self.list_gen = self.list_gen.wrapping_add(1);
+        self.render_cache = built.cache;
+        self.source = Some(built.source);
+        self.rebuilt_parts = built.rebuilt;
+        self.reused_parts = built.reused;
+        self.mesh_key = None;
         if let Some(m) = built.mesh {
+            self.part_meshes = m.data.parts.iter().cloned().collect();
+            self.mesh_bytes = m.data.parts.iter().map(|(_, data)| data.cpu_bytes()).sum();
             if let Ok(mut slot) = self.mesh_slot.lock() {
                 *slot = Some(m.data);
             }
@@ -398,12 +400,12 @@ struct PrimIndex {
 
 impl PrimIndex {
     /// Indices of the primitives drawn for `handles` (in list order).
-    fn prims(&mut self, list_gen: u64, list: &DisplayList, handles: &[Handle]) -> Vec<usize> {
+    fn prims(&mut self, list_gen: u64, list: &impl Geometry, handles: &[Handle]) -> Vec<usize> {
         if handles.is_empty() {
             return Vec::new();
         }
         if self.list_gen != Some(list_gen) {
-            self.by_handle = list.prims.iter().enumerate().map(|(i, p)| (p.handle, i)).collect();
+            self.by_handle = list.primitives().enumerate().map(|(i, (_, p))| (p.handle, i)).collect();
             self.by_handle.sort_unstable();
             self.list_gen = Some(list_gen);
         }
@@ -457,8 +459,8 @@ fn prim_color32(prim: &cadcraft_render::DPrim, bg: Rgb) -> Color32 {
 /// that shows the list (the current view, other model tiles) with its drawing units per pixel.
 ///
 /// A rebuild only the view asks for (a new zoom band, a pan out of the built area) runs in the
-/// background while the current list is drawn (see [`rebuild`]); a changed drawing, or no list
-/// yet, is built at once.
+/// background while the current list is drawn (see [`rebuild`]). Expensive edits use the same
+/// bounded worker; small edits and platforms without threads rebuild immediately.
 fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::Context) {
     let px = 1.0 / xf.scale;
     let Ok(st) = app.session.state() else { return };
@@ -497,6 +499,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     );
     app.canvas.scenes.retain(|s| app.session.docs.iter().any(|d| d.uid == s.key.0));
     if app.canvas.key.0 != st.uid || app.canvas.space != st.space {
+        app.canvas.job = None;
         if let (Some(list), Some(source)) = (app.canvas.list.take(), app.canvas.source.take()) {
             app.canvas.scenes.push_back(Scene {
                 key: app.canvas.key,
@@ -505,7 +508,6 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
                 list,
                 window: app.canvas.window,
                 cache: std::mem::take(&mut app.canvas.render_cache),
-                parts: std::mem::take(&mut app.canvas.parts),
             });
         }
         if let Some(at) = app.canvas.scenes.iter().position(|s| s.key.0 == st.uid && s.space == st.space)
@@ -516,12 +518,12 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
             app.canvas.list = Some(scene.list);
             app.canvas.window = scene.window;
             app.canvas.render_cache = scene.cache;
-            app.canvas.parts = scene.parts;
             app.canvas.rebuilt_parts = 0;
-            app.canvas.reused_parts = app.canvas.parts.len();
+            app.canvas.reused_parts = app.canvas.list.as_ref().map_or(0, |l| l.parts.len());
             app.canvas.build_ms = 0.0;
         }
         app.canvas.space = st.space.clone();
+        app.canvas.key.0 = st.uid;
         app.canvas.mesh_key = None;
         app.canvas.hover_at = None;
         app.canvas.hover = None;
@@ -536,16 +538,14 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     }
     // A background build that finished: use it unless the drawing has changed since it started
     // (or the list was dropped to force a rebuild).
+    let mut force_sync = false;
     if let Some(job) = &app.canvas.job {
         match job.poll() {
             rebuild::Poll::Pending => {}
             rebuild::Poll::Done(built) => {
                 let (job_key, window) = (job.key, job.window);
                 app.canvas.job = None;
-                if app.canvas.list.is_some() && same_content(&job_key, &key) {
-                    app.canvas.render_cache = cadcraft_render::screen::Cache::default();
-                    app.canvas.parts.clear();
-                    app.canvas.part_meshes.clear();
+                if same_content(&job_key, &key) {
                     app.canvas.install(job_key, window, *built);
                     app.canvas.enforce_cache_budget();
                 }
@@ -554,6 +554,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
                 log::warn!("canvas: a background rebuild failed; rebuilding on the UI thread");
                 app.canvas.job = None;
                 app.canvas.list = None;
+                force_sync = true;
             }
         }
     }
@@ -564,7 +565,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     }
     // Only the view moved: keep drawing the current list and build the new one in the background.
     let view_only = app.canvas.list.is_some() && same_content(&app.canvas.key, &key);
-    if view_only && app.canvas.job.as_ref().is_some_and(|j| j.serves(&key, &visible)) {
+    if app.canvas.job.as_ref().is_some_and(|j| j.serves(&key, &visible)) {
         return;
     }
     // A build for another view, or for a drawing that has since changed, is no longer wanted:
@@ -586,7 +587,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
         skip_viewport: split,
         cancel: None,
     };
-    if view_only {
+    if !force_sync && (view_only || (app.tablet_mode && app.canvas.render_cache.changed_work(&st.doc, &st.space, &opts) >= 4096)) {
         let t = Tokens::get();
         let mesh = app.canvas.gpu.is_some().then(|| rebuild::MeshRequest {
             view_center: xf.center,
@@ -595,9 +596,10 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
             paper_bg: Rgb(t.paper.r(), t.paper.g(), t.paper.b()),
             lwdisplay,
             device: app.canvas.gpu_device.clone(),
+            parts: app.canvas.part_meshes.clone(),
         });
         let window = opts.view;
-        let req = rebuild::Request { doc: st.doc.clone(), space: st.space.clone(), opts: opts.clone(), mesh };
+        let req = rebuild::Request { doc: st.doc.clone(), space: st.space.clone(), opts: opts.clone(), mesh, cache: app.canvas.render_cache.clone() };
         if let Some(job) = rebuild::spawn(req, key, window, ctx) {
             app.canvas.job = Some(job);
             return;
@@ -607,11 +609,10 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     if let Some(limit) = app.canvas.cache_limit {
         app.canvas.render_cache.set_budget(limit / 2);
     }
-    let built = app.canvas.render_cache.build(&st.doc, &space, &opts);
+    let built = app.canvas.render_cache.build_scene(&st.doc, &space, &opts);
     app.canvas.rebuilt_parts = built.rebuilt;
     app.canvas.reused_parts = built.reused;
-    app.canvas.parts = built.parts;
-    app.canvas.list = Some(built.list);
+    app.canvas.list = Some(built.scene);
     app.canvas.source = Some(Arc::new((*st.doc).clone()));
     app.canvas.key = key;
     app.canvas.window = opts.view;
@@ -1015,11 +1016,11 @@ fn clip_infinite(xf: &Xf, base: Vec2, dir: Vec2, ray: bool) -> Option<[Pos2; 2]>
 }
 
 /// Draw a display list.
-pub(crate) fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb, lwdisplay: bool) {
+pub(crate) fn draw_list(p: &egui::Painter, xf: &Xf, list: &impl Geometry, bg: Rgb, lwdisplay: bool) {
     let vis = xf.world_bounds();
-    let mut shapes: Vec<Shape> = Vec::with_capacity(list.prims.len());
+    let mut shapes: Vec<Shape> = Vec::with_capacity(list.primitive_count());
     let px = 1.0 / xf.scale;
-    for prim in &list.prims {
+    for (list, prim) in list.primitives() {
         let col = prim_color32(prim, bg);
         let pts = list.points(prim);
         match prim.kind {
@@ -1088,7 +1089,7 @@ pub(crate) fn draw_list(p: &egui::Painter, xf: &Xf, list: &DisplayList, bg: Rgb,
 fn draw_highlight_gpu(
     p: &egui::Painter,
     xf: &Xf,
-    list: &DisplayList,
+    list: &impl Geometry,
     list_gen: u64,
     prims: impl FnOnce() -> Vec<usize>,
     selection_serial: u64,
@@ -1098,7 +1099,7 @@ fn draw_highlight_gpu(
     stencil: crate::gpu::Stencil,
 ) {
     let (hl_key, hl_slot, hl_origin, hl_infinite) = hl;
-    let origin = crate::gpu::choose_origin(&list.bounds, xf.center, f64::from(xf.rect.height()) / xf.scale.max(1e-300));
+    let origin = crate::gpu::choose_origin(list.bounds(), xf.center, f64::from(xf.rect.height()) / xf.scale.max(1e-300));
     let key = {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1108,7 +1109,7 @@ fn draw_highlight_gpu(
     if *hl_key != Some(key) {
         let prims = prims();
         let mesh = crate::gpu::build_highlight_mesh(list, &prims, origin, color.to_array(), look.width, look.dashed);
-        *hl_infinite = prims.into_iter().filter(|&i| list.prims.get(i).is_some_and(|p| matches!(p.kind, Kind::Infinite { .. }))).collect();
+        *hl_infinite = prims.into_iter().filter(|&i| list.primitive(i).is_some_and(|(_, p)| matches!(p.kind, Kind::Infinite { .. }))).collect();
         if let Ok(mut slot) = hl_slot.lock() {
             *slot = Some(mesh);
         }
@@ -1206,31 +1207,31 @@ fn list_mesh_key(key: &ListKey, list_gen: u64, origin: Vec2, bg: Rgb, lwdisplay:
     h.finish()
 }
 
+fn part_mesh_key(part: u64, origin: Vec2, bg: Rgb, lwdisplay: bool) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (part, origin.x.to_bits(), origin.y.to_bits(), bg.0, bg.1, bg.2, lwdisplay).hash(&mut h);
+    h.finish()
+}
+
 /// Draw the display list through the GPU paint callback (uploading it when it changed), plus
 /// the infinite lines, which are clipped to the view on the CPU every frame.
 fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdisplay: bool) {
     let Some(list) = &c.list else { return };
     // A screen window stays fixed through small edits. Using its centre keeps unchanged part
     // buffers valid even when an edit changes the drawing's extents.
-    let bounds = c.window.as_ref().filter(|_| !c.parts.is_empty()).unwrap_or(&list.bounds);
+    let bounds = c.window.as_ref().unwrap_or(&list.bounds);
     let origin = crate::gpu::choose_origin(bounds, xf.center, f64::from(xf.rect.height()) / xf.scale.max(1e-300));
     let key = list_mesh_key(&c.key, c.list_gen, origin, bg, lwdisplay);
     let rebuilt = c.mesh_key != Some(key);
     if rebuilt {
         let t0 = crate::now_ms();
-        let mesh = if c.parts.is_empty() {
-            let mesh = crate::gpu::build_mesh(list, origin, bg, lwdisplay);
-            c.mesh_bytes = mesh.bytes();
-            mesh
-        } else {
+        let mesh = {
             let mut next = HashMap::new();
             let mut mesh = crate::gpu::MeshData::default();
             c.mesh_bytes = 0;
-            for part in &c.parts {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                (part.id, origin.x.to_bits(), origin.y.to_bits(), bg.0, bg.1, bg.2, lwdisplay).hash(&mut h);
-                let id = h.finish();
+            for part in &list.parts {
+                let id = part_mesh_key(part.id, origin, bg, lwdisplay);
                 let data = c.part_meshes.get(&id).cloned().unwrap_or_else(|| {
                     let data = Arc::new(crate::gpu::build_mesh(&part.list, origin, bg, lwdisplay));
                     c.mesh_bytes = c.mesh_bytes.saturating_add(data.bytes());
@@ -1255,7 +1256,7 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
         if let Ok(mut slot) = c.mesh_slot.lock() {
             *slot = Some(mesh);
         }
-        c.infinite = list.prims.iter().enumerate().filter(|(_, pr)| matches!(pr.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+        c.infinite = list.primitives().enumerate().filter(|(_, (_, pr))| matches!(pr.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
         c.mesh_key = Some(key);
         c.mesh_origin = origin;
         c.mesh_ms = crate::now_ms() - t0;
@@ -1276,7 +1277,7 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
         },
     ));
     let mut shapes = Vec::new();
-    for prim in c.infinite.iter().filter_map(|i| list.prims.get(*i)) {
+    for (list, prim) in c.infinite.iter().filter_map(|i| list.primitive(*i)) {
         let pts = list.points(prim);
         if let (Kind::Infinite { ray }, Some(b), Some(d)) = (prim.kind, pts.first(), pts.get(1))
             && let Some(seg) = clip_infinite(xf, *b, *d, ray)
@@ -1312,7 +1313,7 @@ impl Look {
 /// Draw selected/hovered entities as highlight overlays: `prims` are indices into `list` (from
 /// [`PrimIndex::prims`], [`prims_of`], or all of a [`VpHighlight`] list), redrawn in `color` as `look` says. A wipeout is always
 /// outlined, since filling it would hide the drawing under it.
-pub(crate) fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &DisplayList, prims: &[usize], color: Color32, look: Look) {
+pub(crate) fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &impl Geometry, prims: &[usize], color: Color32, look: Look) {
     let stroke = Stroke::new(look.width, color);
     let line = |pts: Vec<Pos2>, out: &mut Vec<Shape>| {
         if look.dashed {
@@ -1324,7 +1325,7 @@ pub(crate) fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &DisplayList, pri
     let mut shapes = Vec::new();
     let mut fill = egui::Mesh::default();
     let fill_color = color.gamma_multiply(crate::gpu::HIGHLIGHT_FILL_ALPHA);
-    for prim in prims.iter().filter_map(|&i| list.prims.get(i)) {
+    for (list, prim) in prims.iter().filter_map(|&i| list.primitive(i)) {
         let pts = list.points(prim);
         match prim.kind {
             Kind::Polyline => line(pts.iter().map(|q| xf.to_screen(*q)).collect(), &mut shapes),
@@ -1776,6 +1777,26 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     };
     // A clipped active viewport's outline (picks and its heavy border follow it).
     let active_clip = app.session.state().ok().and_then(|st| st.active_viewport().and_then(|(h, v)| cadcraft_render::viewport_clip(&st.doc, h, &v)));
+    let mut views = vec![(xf_paper.world_bounds(), 1.0 / xf_paper.scale)];
+    views.extend(tiles.iter().filter(|(r, tile)| !tile.active && r.width() >= 1.0 && r.height() >= 1.0).map(|(r, tile)| {
+        let xf = tile_xf(*r, tile);
+        (xf.world_bounds(), 1.0 / xf.scale)
+    }));
+    ensure_list(app, &xf_paper, &views, ui.ctx());
+    let content_pending = app.canvas.job.as_ref().is_some_and(|j| !same_content(&j.key, &app.canvas.key));
+    if content_pending {
+        // The old scene is only a navigation preview. Never pick deleted/moved geometry against
+        // a newer document while its display is still being built.
+        inside = false;
+        pressed_primary = false;
+        app.canvas.hover = None;
+        app.canvas.snap = None;
+        app.canvas.track = None;
+        app.canvas.drag_window = false;
+        if pointer_inside {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Progress);
+        }
+    }
     // Double-click a viewport to work inside it; double-click the sheet outside it to return.
     if inside
         && dbl_primary
@@ -1952,6 +1973,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // that starts while objects are being selected opens a window where the button went down,
     // and letting go closes it. Drags on grips and drags while drawing are left alone.
     if resp.drag_started_by(egui::PointerButton::Primary)
+        && !content_pending
         && !navigating
         && !middle_down
         && app.session.pending_window.is_none()
@@ -2016,11 +2038,6 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // ---------- paint ----------
     painter.rect_filled(rect, 0.0, t.canvas);
     let t0 = crate::now_ms();
-    let mut views = vec![(xf_paper.world_bounds(), 1.0 / xf_paper.scale)];
-    views.extend(tiles.iter().filter(|(r, tile)| !tile.active && r.width() >= 1.0 && r.height() >= 1.0).map(|(r, tile)| {
-        let xf = tile_xf(*r, tile);
-        (xf.world_bounds(), 1.0 / xf.scale)
-    }));
     ensure_list(app, &xf_paper, &views, ui.ctx());
     let sheet = app.canvas.list.as_ref().and_then(|l| l.sheet);
     let bg = match sheet {

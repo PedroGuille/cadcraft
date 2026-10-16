@@ -647,6 +647,7 @@ pub struct Session {
     /// Object snap tracking: acquired points and the path under the cursor (from the UI's
     /// [`Session::snap_cursor`] calls; direct distance entry follows the path).
     pub tracking: snap::tracking::Tracker,
+    snap_cache: snap::cache::Cache,
     /// Viewport size in pixels (from the UI; used for zoom and pick apertures).
     pub viewport_px: (f64, f64),
     pub clipboard: Vec<Entity>,
@@ -680,6 +681,11 @@ impl Default for Session {
 }
 
 impl Session {
+    /// Optional cursor-neighborhood retention within the host's session memory allowance.
+    pub fn set_snap_cache_budget(&mut self, bytes: usize) {
+        self.snap_cache.set_budget(bytes);
+    }
+
     pub fn new() -> Self {
         let mut s = Session::empty();
         s.new_drawing(false);
@@ -705,6 +711,7 @@ impl Session {
             picked_viewport: None,
             compare: None,
             tracking: snap::tracking::Tracker::default(),
+            snap_cache: snap::cache::Cache::default(),
             viewport_px: (1200.0, 800.0),
             clipboard: Vec::new(),
             clipboard_base: Vec2::ZERO,
@@ -748,6 +755,7 @@ impl Session {
     /// A command still waiting for input belongs to the drawing it started in: end it there
     /// before another drawing becomes current, so its undo step lands in that drawing.
     fn end_running(&mut self) {
+        self.snap_cache.clear();
         if self.running.is_some() {
             self.cancel();
         }
@@ -1332,6 +1340,7 @@ impl Session {
     /// Cancel the running command (Esc). With no command, clears the selection. Inside a
     /// transparent command, cancels it and the command it interrupted.
     pub fn cancel(&mut self) {
+        self.snap_cache.clear();
         self.point_mods.clear();
         // Esc stops a LISP routine waiting for input, and the command it paused in.
         if self.lisp_waiting() {

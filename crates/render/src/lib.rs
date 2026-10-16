@@ -463,6 +463,23 @@ impl Builder<'_> {
             len: 2,
         });
     }
+    /// Reserve the same expansion allowance as an already tessellated block template.
+    fn expand_by(&mut self, count: usize) -> bool {
+        let Some(total) = self.list.expanded.checked_add(count).filter(|n| *n <= MAX_BLOCK_EXPANSION) else { return false };
+        if let Some(spent) = self.shared_budget {
+            use std::sync::atomic::Ordering;
+            let mut old = spent.load(Ordering::Relaxed);
+            loop {
+                let Some(next) = old.checked_add(count).filter(|n| *n <= MAX_BLOCK_EXPANSION) else { return false };
+                match spent.compare_exchange_weak(old, next, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(value) => old = value,
+                }
+            }
+        }
+        self.list.expanded = total;
+        true
+    }
     /// Take one unit of the block-expansion budget; false once it is spent.
     fn expand(&mut self) -> bool {
         self.list.expanded = self.list.expanded.saturating_add(1);

@@ -262,9 +262,16 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
 /// the CPU path: lines `width` points wide, and fills filled, or with `dashed` (SELECTIONEFFECT 0;
 /// the callback's `dash` dashes the lines) outlined. A wipeout is always outlined, since filling it
 /// would hide the drawing; infinite lines are left to the CPU (they are clipped per frame).
-pub fn build_highlight_mesh(list: &DisplayList, prims: &[usize], origin: Vec2, color: [u8; 4], width: f32, dashed: bool) -> MeshData {
+pub fn build_highlight_mesh(
+    list: &impl cadcraft_render::screen::Geometry,
+    prims: &[usize],
+    origin: Vec2,
+    color: [u8; 4],
+    width: f32,
+    dashed: bool,
+) -> MeshData {
     let mut m = MeshData::default();
-    for prim in prims.iter().filter_map(|&i| list.prims.get(i)) {
+    for (list, prim) in prims.iter().filter_map(|&i| list.primitive(i)) {
         let pts = list.points(prim);
         match prim.kind {
             Kind::Polyline => {
@@ -391,6 +398,12 @@ struct Batch {
 }
 
 /// One uploaded mesh with its own view uniform (each callback's transform differs).
+struct DrawSpan {
+    lane: usize,
+    batch: usize,
+    range: std::ops::Range<u32>,
+}
+
 struct Layer {
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
@@ -402,6 +415,7 @@ struct Layer {
     parts: std::collections::VecDeque<(u64, std::sync::Arc<Uploaded>)>,
     part_bytes: usize,
     active_parts: std::collections::HashSet<u64>,
+    draws: Vec<DrawSpan>,
 }
 
 impl Uploaded {
@@ -429,6 +443,7 @@ impl Layer {
             self.tris = data.tris;
             self.quads = data.quads;
             self.breaks = data.breaks;
+            self.plan_draws();
             return;
         }
         self.lines.clear();
@@ -460,6 +475,26 @@ impl Layer {
                 let Some((_, old)) = self.parts.pop_front() else { break };
                 self.part_bytes = self.part_bytes.saturating_sub(old.bytes);
             }
+        }
+        self.plan_draws();
+    }
+
+    // Wipeouts define ordering barriers. Resolve each group's batch ranges once per upload,
+    // rather than allocating and rescanning every batch on each cursor-only frame.
+    fn plan_draws(&mut self) {
+        self.draws.clear();
+        let lanes = [&self.tris, &self.lines, &self.quads];
+        let all = lanes.map(|bs| bs.iter().map(|b| b.count as usize).sum::<usize>());
+        let mut from = [0; 3];
+        for to in self.breaks.iter().copied().chain(std::iter::once(all)) {
+            for (lane, batches) in lanes.iter().enumerate() {
+                self.draws.extend(batch_ranges(batches.iter().map(|b| b.count), from[lane]..to[lane]).into_iter().map(|(batch, range)| DrawSpan {
+                    lane,
+                    batch,
+                    range,
+                }));
+            }
+            from = to;
         }
     }
 }
@@ -623,6 +658,7 @@ impl Resources {
                 parts: std::collections::VecDeque::new(),
                 part_bytes: 0,
                 active_parts: Default::default(),
+                draws: Vec::new(),
             }
         };
         // A render pass with a stencil buffer needs every pipeline to name its format; only the
@@ -821,6 +857,7 @@ pub fn trim_cache(rs: &egui_wgpu::RenderState) {
             layer.tris.clear();
             layer.quads.clear();
             layer.breaks.clear();
+            layer.draws.clear();
             layer.parts.clear();
             layer.active_parts.clear();
             layer.part_bytes = 0;
@@ -861,7 +898,10 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
         let [ma, mb, mc, md, tx, ty] = self.xform;
         let d = [ma, mb, mc, md];
         let e = [tx, ty, 0.0, 0.0];
-        let bytes: Vec<u8> = a.iter().chain(&b).chain(&c).chain(&d).chain(&e).flat_map(|v| v.to_le_bytes()).collect();
+        let mut bytes = [0u8; UNIFORM_SIZE as usize];
+        for (dst, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(a.iter().chain(&b).chain(&c).chain(&d).chain(&e)) {
+            dst.copy_from_slice(&value.to_le_bytes());
+        }
         queue.write_buffer(&res.uniform, 0, &bytes);
         Vec::new()
     }
@@ -891,25 +931,20 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
             pass.set_stencil_reference(1);
         }
         let mask = self.stencil == Stencil::Mask;
-        // Draw-order groups split at each wipeout; without wipeouts there is one group.
-        let total = |bs: &[Batch]| bs.iter().map(|b| b.count as usize).sum::<usize>();
-        let all = [total(&res.tris), if mask { 0 } else { total(&res.lines) }, if mask { 0 } else { total(&res.quads) }];
-        let mut from = [0usize; 3];
-        for to in res.breaks.iter().copied().chain(std::iter::once(all)) {
-            for (i, (pipeline, batches)) in [(tri, &res.tris), (line, &res.lines), (quad, &res.quads)].into_iter().enumerate() {
-                let parts = batch_ranges(batches.iter().map(|b| b.count), from[i]..to[i]);
-                if parts.is_empty() {
-                    continue;
-                }
-                pass.set_pipeline(pipeline);
-                for (j, r) in parts {
-                    let Some(b) = batches.get(j) else { continue };
-                    pass.set_vertex_buffer(0, b.buffer.slice(..));
-                    // Quads are instanced: six vertices per instance.
-                    if i == 2 { pass.draw(0..6, r) } else { pass.draw(r, 0..1) }
-                }
+        let lanes = [(tri, &res.tris), (line, &res.lines), (quad, &res.quads)];
+        let mut previous_lane = None;
+        for draw in &res.draws {
+            if mask && draw.lane != 0 {
+                continue;
             }
-            from = to;
+            let Some((pipeline, batches)) = lanes.get(draw.lane) else { continue };
+            let Some(batch) = batches.get(draw.batch) else { continue };
+            if previous_lane != Some(draw.lane) {
+                pass.set_pipeline(pipeline);
+                previous_lane = Some(draw.lane);
+            }
+            pass.set_vertex_buffer(0, batch.buffer.slice(..));
+            if draw.lane == 2 { pass.draw(0..6, draw.range.clone()) } else { pass.draw(draw.range.clone(), 0..1) }
         }
     }
 }

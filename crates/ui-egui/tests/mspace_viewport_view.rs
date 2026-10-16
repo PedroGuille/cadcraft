@@ -74,10 +74,10 @@ fn content(h: &Harness<'_, CadApp>) -> (Bounds2, u64) {
 /// The model geometry the layout's own list draws through viewports, on paper.
 fn in_layout_list(h: &Harness<'_, CadApp>) -> Bounds2 {
     let list = h.state().canvas.list.as_ref().expect("a display list");
-    list.prims
-        .iter()
-        .filter(|p| p.handle == VIEWPORT_CONTENT)
-        .fold(Bounds2::EMPTY, |b, p| b.union(&Bounds2::from_points(list.points(p).iter().copied())))
+    use cadcraft_render::screen::Geometry;
+    list.primitives()
+        .filter(|(_, p)| p.handle == VIEWPORT_CONTENT)
+        .fold(Bounds2::EMPTY, |b, (list, p)| b.union(&Bounds2::from_points(list.points(p).iter().copied())))
 }
 
 fn revision(h: &Harness<'_, CadApp>) -> u64 {

@@ -792,8 +792,15 @@ impl crate::Session {
         let cfg = TrackConfig::relative_to(&s, angbase, last);
         let osmode = s.osmode | if s.osnaphatch { mode::HATCH } else { 0 };
         let ix = crate::spatial::index(&doc, &space);
-        let (hit, near_prims) = super::osnap_with_neighborhood(&doc, &space, &ix, raw, q.aperture, osmode, q.base, q.deferred);
-        let cand = match (osmode & mode::HATCH, near_prims.as_deref()) {
+        let cached = self.snap_cache.nearby(&doc, &space, &ix, raw, q.aperture, osmode);
+        let (hit, near_prims) = match &cached {
+            Some(g) => {
+                (super::resolve_neighborhood(g.cands.clone(), &g.prims, Some(&g.segments), raw, q.aperture, osmode, q.base, q.deferred, None), None)
+            }
+            None => super::osnap_with_neighborhood(&doc, &space, &ix, raw, q.aperture, osmode, q.base, q.deferred),
+        };
+        let prims = cached.as_ref().map(|g| g.prims.as_slice()).or(near_prims.as_deref());
+        let cand = match (osmode & mode::HATCH, prims) {
             (0, Some(prims)) => candidate_with_prims(raw, hit.as_ref(), q.aperture, &cfg, q.base, prims),
             _ => candidate(&doc, &space, raw, hit.as_ref(), q.aperture, &cfg, q.base),
         };

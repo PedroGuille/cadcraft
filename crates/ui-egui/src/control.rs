@@ -267,7 +267,7 @@ pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
         "snap": app.canvas.snap.map(|s| json!({"point": [s.point.x, s.point.y], "mode": s.name})),
         "session": app.session.summary(),
         "closePrompt": app.close_prompt(),
-        "perf": {"frameMs": app.frame_ms, "buildMs": app.canvas.build_ms, "drawMs": app.canvas.draw_ms, "meshMs": app.canvas.mesh_ms, "rebuiltParts": app.canvas.rebuilt_parts, "reusedParts": app.canvas.reused_parts, "rebuiltMeshBytes": app.canvas.mesh_bytes, "building": app.canvas.building(), "renderer": if app.canvas.gpu.is_some() { "gpu" } else { "cpu" }, "prims": app.canvas.list.as_ref().map(|l| l.prims.len())},
+        "perf": {"frameMs": app.frame_ms, "buildMs": app.canvas.build_ms, "drawMs": app.canvas.draw_ms, "meshMs": app.canvas.mesh_ms, "rebuiltParts": app.canvas.rebuilt_parts, "reusedParts": app.canvas.reused_parts, "rebuiltMeshBytes": app.canvas.mesh_bytes, "building": app.canvas.building(), "renderer": if app.canvas.gpu.is_some() { "gpu" } else { "cpu" }, "prims": app.canvas.list.as_ref().map(cadcraft_render::screen::Geometry::primitive_count)},
     })
 }
 
