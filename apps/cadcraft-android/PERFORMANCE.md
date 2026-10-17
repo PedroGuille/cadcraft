@@ -1,17 +1,16 @@
 # Tablet rendering and history
 
-Navigation uses temporary screen geometry: patterned hatches show their boundaries, gradients
-use a flat preview, text shows its extent, and curves use a coarser chord tolerance. After
-180 ms without view movement, a detailed rebuild is requested on the existing bounded worker.
-Screen geometry also replaces subpixel thin curves with point markers. The drawing database,
-engine snapping and file/export geometry are unchanged.
+Navigation retains the same text, hatch, gradient and curve geometry detail as the stationary
+view, with no navigation-specific substitutions or coarser chord tolerance. Screen geometry
+still replaces subpixel thin curves with point markers. The drawing database, engine snapping
+and file/export geometry are unchanged.
 
-Tablet Settings offers independent switches for simpler navigation previews and reduced
-navigation resolution, plus a 15–60 fps drawing refresh setting (30 by default). Reduced
-resolution uses up to 65% of the native width and height while navigating; interface controls
-and live overlays retain native resolution. The previous image is reprojected between drawing
-refreshes, so the refresh limit never sleeps or delays pen input. Idle rendering stays driven
-by events and existing host timers.
+Tablet Settings offers reduced navigation resolution and a 15–60 fps drawing refresh setting
+(30 by default). Reduced resolution uses up to 65% of the native width and height while
+navigating; interface controls and live overlays retain native resolution. The previous image
+is reprojected between drawing refreshes, so the refresh limit never sleeps or delays pen input.
+After 180 ms without view movement, navigation ends and the native-resolution image returns.
+Idle rendering stays driven by events and existing host timers.
 
 The main drawing can be retained as one transparent GPU image below cursor, snap, selection
 and command overlays. Changes to content, view, background, clipping, size or DPI invalidate
@@ -45,7 +44,7 @@ conservative estimates and are not allocator telemetry.
 
 Validation uses the existing repository checks plus private rendering comparisons on software
 Vulkan and OpenGL ES: repeated blocks, wide lines, transparency, cross-chunk wipeouts,
-stationary cache reuse, navigation pacing/detail restoration, pressure fallback, culling and
+stationary cache reuse, navigation pacing/resolution restoration, pressure fallback, culling and
 history sharing. These checks establish behavior; device-specific GPU time, battery use and
 thermal improvements still require measurements on Android hardware.
 

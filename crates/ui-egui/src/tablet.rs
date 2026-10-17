@@ -21,7 +21,6 @@ pub struct Preferences {
     pub compact: bool,
     pub cache_mib: u32,
     pub recovery_seconds: u64,
-    pub simplify_navigation: bool,
     pub reduced_navigation_resolution: bool,
     pub navigation_fps: u32,
 }
@@ -37,7 +36,6 @@ impl Default for Preferences {
             compact: false,
             cache_mib: 24,
             recovery_seconds: 5,
-            simplify_navigation: true,
             reduced_navigation_resolution: true,
             navigation_fps: 30,
         }
@@ -234,7 +232,6 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.cache_mib, 8..=64).text(crate::i18n::t("Render cache (MB)")));
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.recovery_seconds, 2..=60).text(crate::i18n::t("Recovery interval (s)")));
                 ui.separator();
-                ui.checkbox(&mut app.tablet_prefs.simplify_navigation, crate::i18n::t("Simplify while panning and zooming"));
                 ui.checkbox(&mut app.tablet_prefs.reduced_navigation_resolution, crate::i18n::t("Lower resolution while panning and zooming"));
                 ui.add(
                     egui::Slider::new(&mut app.tablet_prefs.navigation_fps, 15..=60).text(crate::i18n::t("Drawing refresh during navigation (fps)")),

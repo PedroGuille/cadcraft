@@ -509,8 +509,7 @@ impl Cache {
 }
 
 fn same_options(a: &Options, b: &Options) -> bool {
-    a.navigation == b.navigation
-        && a.tolerance.to_bits() == b.tolerance.to_bits()
+    a.tolerance.to_bits() == b.tolerance.to_bits()
         && a.min_dash.to_bits() == b.min_dash.to_bits()
         && a.text == b.text
         && a.fill == b.fill

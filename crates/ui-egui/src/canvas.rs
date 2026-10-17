@@ -40,7 +40,7 @@ impl Xf {
 
 /// What a display list was built from: drawing uid, revision, tessellation band, hatch level of
 /// detail band, lineweight display, document and active viewport view (see [`ensure_list`]).
-type ListKey = (u64, u64, i32, i32, bool, bool, usize, u64, u64, bool);
+type ListKey = (u64, u64, i32, i32, bool, bool, usize, u64, u64);
 
 /// Whether two list keys are for the same drawing content (they may differ only in the view).
 fn same_content(a: &ListKey, b: &ListKey) -> bool {
@@ -51,7 +51,6 @@ fn same_content(a: &ListKey, b: &ListKey) -> bool {
 pub struct CanvasState {
     navigation_view: Option<(Vec2, f64)>,
     navigation_until: f64,
-    navigation_preview: bool,
     navigation_active: bool,
     reduced_navigation_resolution: bool,
     navigation_fps: u32,
@@ -494,8 +493,6 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     if navigation {
         ctx.request_repaint_after(std::time::Duration::from_secs_f64((app.canvas.navigation_until - now).max(0.001)));
     }
-    let navigation = navigation && app.tablet_prefs.simplify_navigation;
-    app.canvas.navigation_preview = navigation;
     let px = 1.0 / xf.scale;
     let Ok(st) = app.session.state() else { return };
     // Rebuild when the drawing changes, the zoom moves by more than 2x (tessellation band) or a
@@ -503,7 +500,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     let band = |px: f64| px.max(1e-300).log2().floor() as i32;
     // Hatch level of detail follows the finest view showing the list.
     let lod_band = views.iter().map(|v| band(v.1)).fold(band(px), i32::min);
-    let curve_band = band(px).saturating_add(if navigation { 2 } else { 0 });
+    let curve_band = band(px);
     // The active MSPACE viewport's contents are drawn apart (see `VpContent`), so panning and
     // zooming inside it leave this list alone. Without a stencil buffer a clipped viewport's
     // contents stay in the list, which then follows its view: realtime navigation changes it
@@ -531,7 +528,6 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
         std::sync::Arc::as_ptr(&st.doc) as usize,
         vp_view,
         cadcraft_render::screen::font_revision(),
-        navigation,
     );
     app.canvas.scenes.retain(|s| app.session.docs.iter().any(|d| d.uid == s.key.0));
     if app.canvas.key.0 != st.uid || app.canvas.space != st.space {
@@ -609,7 +605,6 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     app.canvas.job = None;
     let t0 = crate::now_ms();
     let opts = cadcraft_render::Options {
-        navigation,
         tolerance: 2f64.powi(curve_band) * 0.5,
         // Two pixels at the band's finest zoom: the list serves every zoom in the band, so its
         // level of detail must hold at the finest one.
@@ -691,7 +686,7 @@ struct VpContent {
     list: DisplayList,
     /// What the list was built from: drawing, revision, document, viewport, tessellation band
     /// and lineweight display.
-    key: Option<(u64, u64, usize, Handle, i32, bool, bool, bool)>,
+    key: Option<(u64, u64, usize, Handle, i32, bool, bool)>,
     /// The viewport's view (centre, height) the list was built for, and the paper area it covers.
     view: (Vec2, f64),
     area: Bounds2,
@@ -741,7 +736,6 @@ struct VpFrame {
 
 /// Build or reuse the active viewport's [`VpContent`] for this frame.
 fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Context) -> Option<VpFrame> {
-    let navigation = app.canvas.navigation_preview;
     let (lwdisplay, transparency) = (app.session.settings.lwdisplay, app.session.settings.transparency_display);
     let stencil = stencil_clip(app);
     let c = &mut app.canvas.vp;
@@ -758,8 +752,8 @@ fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Context) -> Op
         None => Bounds2::new(vp.center.xy() - half, vp.center.xy() + half),
     };
     let px = 1.0 / xf_paper.scale.max(1e-300);
-    let band = (px.max(1e-300).log2().floor() as i32).saturating_add(if navigation { 2 } else { 0 });
-    let key = (st.uid, st.revision, std::sync::Arc::as_ptr(&st.doc) as usize, h, band, lwdisplay, transparency, navigation);
+    let band = px.max(1e-300).log2().floor() as i32;
+    let key = (st.uid, st.revision, std::sync::Arc::as_ptr(&st.doc) as usize, h, band, lwdisplay, transparency);
     let now = crate::now_ms();
     let view = (vp.view_center, vp.view_height);
     if view != c.last_view {
@@ -785,7 +779,6 @@ fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Context) -> Op
         // only moves the geometry.
         let area = rect.expand(rect.width().max(rect.height()) * 0.5);
         let opts = cadcraft_render::Options {
-            navigation,
             tolerance: 2f64.powi(band) * 0.5,
             min_dash: 2f64.powi(band) * 2.0,
             text: true,
