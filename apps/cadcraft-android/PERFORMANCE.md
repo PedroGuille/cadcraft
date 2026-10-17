@@ -78,3 +78,36 @@ previous GPU allowance so sharp canvas images still fit on higher-resolution tab
 third to outlines and two thirds to tessellation. Memory-pressure trimming discards cold entries;
 strong references from active geometry remain valid. These allowances describe reusable payload,
 not a hard process-memory cap or allocator telemetry. Desktop defaults remain unchanged.
+
+## Entity damage, spatial ranges and vector text (Android 0.1.2)
+
+Changed chunks carry rendered bounds and immutable source identities for their individual
+entities. The image cache compares only replaced chunks, retaining unchanged chunks as cheap
+draw-order anchors. Editing, moving, deleting and undoing an object invalidates its old and new
+bounds rather than the entire scattered chunk. A changed rendering context invalidates affected
+entities even when their source objects are unchanged. Reordering, unknown/non-finite bounds and
+oversized comparisons conservatively refresh the image. Source references keep identity safe
+through snapshot replacement and undo.
+
+Each ordinary 384-record GPU range has a compact spatial hierarchy over 24-record ranges.
+Visibility queries return surviving ranges in their original order; fully visible ranges still
+merge into a single draw. Lines and triangles are never split across primitive boundaries, and
+wide-line margins, transparency, stencil lanes and wipeout barriers retain their semantics.
+Index payload is included in uploaded-mesh retention accounting.
+
+The built-in drafting font now records canonical glyph placements alongside its compatibility
+polylines. Interactive scenes share these stroke templates through the existing glyph budget,
+including transformed TEXT/MTEXT. Decorations, missing-glyph boxes, subpixel stroke simplification
+and precision-sensitive placements retain the full path. Exports and engine geometry are unchanged.
+
+Mixed characters use shared vector geometry pages on the GPU, rather than copying each glyph or
+issuing one draw per character. A page holds at most 16,384 float records (256 KiB); a placement
+holds its affine transform, glyph range, colour and width. Filled outlines, hairlines and wide
+strokes have separate lanes. Consecutive compatible placements batch without sorting CAD content.
+Per-glyph bounds reject invisible placements; groups cap padding work and placement counts.
+Pages are created only when shared geometry amortizes their texture and placement payload.
+Rare complex outlines, oversized/unsupported glyphs and precision-sensitive transforms use the existing upload path.
+The shader uses a vertex-readable float texture supported by GLES 3 and WebGL2, without storage
+buffers, raster glyphs or loss of vector detail. Pages share the existing block-cache allowance;
+weak lookups preserve active sharing when optional retention is zero. Worker uploads use the
+render queue, so a newly visible page can be prepared off the UI thread.

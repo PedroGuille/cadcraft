@@ -28,10 +28,11 @@ enum Detail {
 type Key = (usize, usize, u32, u16, Detail);
 
 pub(crate) struct Mesh {
-    _face: ttf::Face,
+    _face: Option<ttf::Face>,
     contours: Arc<[Vec<Vec2>]>,
     pub triangles: Vec<Vec2>,
-    templates: Mutex<Vec<(cadcraft_color::Rgb, bool, u8, Weak<crate::DisplayList>)>>,
+    stroke_mask: Option<u64>,
+    templates: Mutex<Vec<(cadcraft_color::Rgb, bool, u8, u32, Weak<crate::DisplayList>)>>,
 }
 
 impl Mesh {
@@ -46,11 +47,12 @@ impl Mesh {
             .saturating_add(std::mem::size_of::<Self>())
     }
 
-    pub(super) fn template(&self, color: cadcraft_color::Rgb, aci7: bool, transparency: u8) -> Arc<crate::DisplayList> {
+    pub(super) fn template(&self, color: cadcraft_color::Rgb, aci7: bool, transparency: u8, lw: f32) -> Arc<crate::DisplayList> {
         let mut templates = self.templates.lock().unwrap_or_else(PoisonError::into_inner);
-        templates.retain(|(_, _, _, weak)| weak.strong_count() > 0);
-        if let Some(list) =
-            templates.iter().find_map(|(c, a, t, weak)| (*c == color && *a == aci7 && *t == transparency).then(|| weak.upgrade()).flatten())
+        templates.retain(|(_, _, _, _, weak)| weak.strong_count() > 0);
+        if let Some(list) = templates
+            .iter()
+            .find_map(|(c, a, t, w, weak)| (*c == color && *a == aci7 && *t == transparency && *w == lw.to_bits()).then(|| weak.upgrade()).flatten())
         {
             return list;
         }
@@ -68,18 +70,40 @@ impl Mesh {
                 len: list.tris.len() as u32,
             });
         }
+        if let Some(mask) = self.stroke_mask {
+            for (i, points) in self.contours.iter().enumerate() {
+                let collapsed = mask & (1u64.checked_shl(i as u32).unwrap_or(0)) != 0;
+                let start = list.verts.len() as u32;
+                if collapsed {
+                    list.verts.push(Bounds2::from_points(points.iter().copied()).center());
+                } else {
+                    list.verts.extend_from_slice(points);
+                }
+                let len = list.verts.len() as u32 - start;
+                list.prims.push(crate::DPrim {
+                    handle: cadcraft_doc::Handle(0),
+                    color,
+                    aci7,
+                    lw,
+                    transparency,
+                    kind: if collapsed { crate::Kind::Point } else { crate::Kind::Polyline },
+                    start,
+                    len,
+                });
+            }
+            list.bounds = Bounds2::from_points(list.verts.iter().copied());
+        }
         let list = Arc::new(list);
         if templates.len() >= 16 {
             templates.remove(0);
         }
-        templates.push((color, aci7, transparency, Arc::downgrade(&list)));
+        templates.push((color, aci7, transparency, lw.to_bits(), Arc::downgrade(&list)));
         list
     }
 }
 
 struct Entry {
     // Keep the bytes alive: registering a replacement font must never reuse this key's address.
-    _face: ttf::Face,
     mesh: Arc<Mesh>,
     used: AtomicBool,
     bytes: usize,
@@ -173,7 +197,13 @@ pub(super) fn mesh(g: &TextGlyph, xf: Mat3, pixel: f64) -> Arc<Mesh> {
     let points = contours.iter().map(Vec::len).try_fold(0usize, usize::checked_add);
     // Font data is untrusted; don't hand unbounded or invalid paths to the tessellator.
     if !points.is_some_and(|n| n <= MAX_POINTS) || contours.iter().flatten().any(|p| !p.is_finite() || p.x.abs().max(p.y.abs()) > 1.0e6) {
-        return Arc::new(Mesh { _face: g.face.clone(), contours: Arc::default(), triangles: Vec::new(), templates: Mutex::default() });
+        return Arc::new(Mesh {
+            _face: Some(g.face.clone()),
+            contours: Arc::default(),
+            triangles: Vec::new(),
+            stroke_mask: None,
+            templates: Mutex::default(),
+        });
     }
     let contours = match detail {
         Detail::Full => contours,
@@ -187,13 +217,18 @@ pub(super) fn mesh(g: &TextGlyph, xf: Mat3, pixel: f64) -> Arc<Mesh> {
             }
         }
     };
-    let mesh = Arc::new(Mesh { _face: g.face.clone(), triangles: triangulate(&contours), contours, templates: Mutex::default() });
+    let mesh =
+        Arc::new(Mesh { _face: Some(g.face.clone()), triangles: triangulate(&contours), contours, stroke_mask: None, templates: Mutex::default() });
+    retain(key, mesh)
+}
+
+fn retain(key: Key, mesh: Arc<Mesh>) -> Arc<Mesh> {
     let points = mesh.contours.iter().map(Vec::capacity).sum::<usize>().saturating_add(mesh.triangles.capacity());
     let bytes = points
         .saturating_mul(std::mem::size_of::<Vec2>())
         .saturating_add(mesh.contours.len().saturating_mul(std::mem::size_of::<Vec<Vec2>>()))
         .saturating_add(std::mem::size_of::<Entry>() + std::mem::size_of::<Key>() + std::mem::size_of::<Mesh>())
-        .saturating_add(16 * std::mem::size_of::<(cadcraft_color::Rgb, bool, u8, Weak<crate::DisplayList>)>());
+        .saturating_add(16 * std::mem::size_of::<(cadcraft_color::Rgb, bool, u8, u32, Weak<crate::DisplayList>)>());
     let mut c = cache().write().unwrap_or_else(PoisonError::into_inner);
     if let Some(existing) = c.entries.get(&key) {
         existing.used.store(true, Ordering::Relaxed);
@@ -213,10 +248,35 @@ pub(super) fn mesh(g: &TextGlyph, xf: Mat3, pixel: f64) -> Arc<Mesh> {
         c.trim(bytes);
         c.bytes = c.bytes.saturating_add(bytes);
         c.clock.push_back(key);
-        c.entries.insert(key, Entry { _face: g.face.clone(), mesh: mesh.clone(), used: AtomicBool::new(true), bytes });
+        c.entries.insert(key, Entry { mesh: mesh.clone(), used: AtomicBool::new(true), bytes });
     }
 
     mesh
+}
+
+/// Drafting-font templates share the same bounded cache and weak live-scene lookup as outlines.
+pub(super) fn stroke(g: &cadcraft_fonts::StrokeGlyph, mask: u64) -> Option<Arc<Mesh>> {
+    if g.spec.len() > 1024 {
+        return None;
+    }
+    // Face allocations are non-null; a zero first component reserves a disjoint namespace
+    // for static built-in font specifications, including the selected screen-detail mask.
+    let key = (0, g.spec.as_ptr() as usize, (mask >> 16) as u32, mask as u16, Detail::Full);
+    if let Some(entry) = cache().read().unwrap_or_else(PoisonError::into_inner).entries.get(&key) {
+        entry.used.store(true, Ordering::Relaxed);
+        return Some(entry.mesh.clone());
+    }
+    if let Some(mesh) = cache().read().unwrap_or_else(PoisonError::into_inner).weak.get(&key).and_then(Weak::upgrade) {
+        return Some(mesh);
+    }
+    let contours = g.geometry();
+    if contours.len() > 48 {
+        return None;
+    }
+    Some(retain(
+        key,
+        Arc::new(Mesh { _face: None, contours: contours.into(), triangles: Vec::new(), stroke_mask: Some(mask), templates: Mutex::default() }),
+    ))
 }
 
 /// Iterative Douglas-Peucker on a closed contour. Never collapse a hole to a line or recurse

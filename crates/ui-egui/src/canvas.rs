@@ -64,7 +64,7 @@ pub struct CanvasState {
     cache_limit: Option<usize>,
     scenes: VecDeque<Scene>,
     part_meshes: HashMap<u64, Arc<crate::gpu::MeshData>>,
-    image_parts: Arc<[(u64, Bounds2)]>,
+    image_parts: Arc<[cadcraft_render::screen::DamagePart]>,
     block_meshes: Arc<std::sync::Mutex<crate::gpu::blocks::Cache>>,
     selection: Selection,
     pub rebuilt_parts: usize,
@@ -85,6 +85,7 @@ pub struct CanvasState {
     pub gpu: Option<crate::gpu::GpuTarget>,
     /// The wgpu device, for background rebuilds to create their buffers (see [`rebuild`]).
     pub gpu_device: Option<egui_wgpu::wgpu::Device>,
+    pub gpu_queue: Option<egui_wgpu::wgpu::Queue>,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
     mesh_slot: crate::gpu::MeshSlot,
@@ -632,6 +633,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
             paper_bg: Rgb(t.paper.r(), t.paper.g(), t.paper.b()),
             lwdisplay,
             device: app.canvas.gpu_device.clone(),
+            queue: app.canvas.gpu_queue.clone(),
             parts: app.canvas.part_meshes.clone(),
             blocks: app.canvas.block_meshes.clone(),
         });
@@ -1265,8 +1267,7 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
     let key = list_mesh_key(&c.key, c.list_gen, origin, bg, lwdisplay);
     let rebuilt = c.mesh_key != Some(key);
     if rebuilt {
-        c.image_parts =
-            list.parts.iter().map(|part| (part.id, Bounds2 { min: part.list.bounds.min - origin, max: part.list.bounds.max - origin })).collect();
+        c.image_parts = list.parts.iter().map(|part| part.damage_part(origin)).collect();
         let t0 = crate::now_ms();
         let mesh = {
             let mut next = HashMap::new();

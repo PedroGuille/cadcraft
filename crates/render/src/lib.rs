@@ -434,8 +434,40 @@ impl Builder<'_> {
             }
             return;
         }
-        for s in &sh.strokes {
+        let mut glyphs = sh.stroke_text.iter().peekable();
+        let mut at = 0;
+        while let Some(s) = sh.strokes.get(at) {
+            while glyphs.peek().is_some_and(|g| g.strokes.start < at) {
+                glyphs.next();
+            }
+            if self.sharing
+                && let Some(g) = glyphs
+                    .peek()
+                    .filter(|g| g.strokes.start == at && g.strokes.end > at && g.strokes.end <= sh.strokes.len() && g.strokes.len() <= 48)
+            {
+                let xf = ctx.xf.then_before(Mat3 { a: g.x.x, b: g.x.y, c: g.y.x, d: g.y.y, e: g.origin.x, f: g.origin.y });
+                let mut mask = 0u64;
+                if self.opts.min_dash > 0.0 && (!self.opts.lineweights || lw <= 0.0) {
+                    for (i, points) in sh.strokes.get(g.strokes.clone()).unwrap_or(&[]).iter().enumerate().filter(|(_, p)| p.len() > 4) {
+                        let b = Bounds2::from_points(points.iter().copied());
+                        if b.width().max(b.height()) * max_scale(&ctx.xf) < self.opts.min_dash * 0.5 {
+                            mask |= 1u64.checked_shl(i as u32).unwrap_or(0);
+                        }
+                    }
+                }
+                if mask == 0
+                    && g.origin.x.abs().max(g.origin.y.abs()) * f64::EPSILON * 64.0 <= self.opts.tolerance.abs() * 0.5
+                    && let Some(mesh) = text::stroke(g, mask)
+                {
+                    let (ink, weight) = self.styled(color, lw);
+                    self.instance(mesh.template(ink.rgb, ink.aci7, self.transparency, weight), xf, ctx.top, Some(mesh.clone()));
+                    at = g.strokes.end;
+                    glyphs.next();
+                    continue;
+                }
+            }
             self.polyline(ctx, color, lw, s);
+            at += 1;
         }
         if sh.glyphs.is_empty() {
             return;
@@ -454,7 +486,7 @@ impl Builder<'_> {
                     let mesh = crate::text::mesh(t, xf, pixel);
                     if self.sharing {
                         let (ink, _) = self.styled(color, 0.0);
-                        self.instance(mesh.template(ink.rgb, ink.aci7, self.transparency), xf, ctx.top, Some(mesh.clone()));
+                        self.instance(mesh.template(ink.rgb, ink.aci7, self.transparency, 0.0), xf, ctx.top, Some(mesh.clone()));
                     } else {
                         self.tris_at(ctx, color, &mesh.triangles, xf);
                     }
@@ -1543,7 +1575,13 @@ fn dimension(b: &mut Builder, ctx: &Ctx, e: &Entity, dm: &cadcraft_doc::Dimensio
         b.tris(ctx, dim_rgb, t);
     }
     if b.opts.text {
-        let sh = cadcraft_fonts::Shaped { strokes: g.text.clone(), glyphs: g.text_glyphs.clone(), width: 0.0, text: g.text_runs.clone() };
+        let sh = cadcraft_fonts::Shaped {
+            strokes: g.text.clone(),
+            glyphs: g.text_glyphs.clone(),
+            width: 0.0,
+            text: g.text_runs.clone(),
+            stroke_text: Vec::new(),
+        };
         b.shaped(ctx, txt_rgb, lw, &sh);
     }
 }

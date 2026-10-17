@@ -24,7 +24,9 @@ use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt;
 
 pub mod blocks;
+mod culling;
 mod image;
+mod text;
 mod tiles;
 pub use image::CachedCanvasCallback;
 
@@ -117,6 +119,7 @@ pub struct MeshData {
     /// order; masks still split the complete scene, rather than drawing one chunk at a time.
     pub parts: Vec<(u64, std::sync::Arc<MeshData>)>,
     instance: Option<blocks::InstanceData>,
+    glyphs: Option<text::InstanceData>,
     /// The vertex buffers already created from this data (see [`MeshData::upload_now`]); the
     /// paint callback then only swaps them in.
     uploaded: Option<Uploaded>,
@@ -136,13 +139,14 @@ impl MeshData {
     /// Create the vertex buffers now, on the calling thread, and let the CPU copy go. Making a
     /// buffer zero-fills and copies it: about 0.35 s for a million-primitive drawing, which a
     /// background rebuild does off the UI thread (see `canvas::rebuild`).
-    pub fn upload_now(&mut self, device: &wgpu::Device) {
-        self.uploaded = Some(Uploaded::new(device, self));
+    pub fn upload_now(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
+        self.uploaded = Some(Uploaded::new(device, queue, self));
         self.lines = Vec::new();
         self.tris = Vec::new();
         self.quads = Vec::new();
         self.parts = Vec::new();
         self.instance = None;
+        self.glyphs = None;
     }
 
     pub fn line_vertices(&self) -> usize {
@@ -161,6 +165,7 @@ impl MeshData {
             .saturating_add(self.quads.len())
             .saturating_add(self.parts.iter().map(|(_, p)| p.bytes()).sum::<usize>())
             .saturating_add(self.instance.as_ref().map_or(0, blocks::InstanceData::bytes))
+            .saturating_add(self.glyphs.as_ref().map_or(0, text::InstanceData::bytes))
     }
     pub fn cpu_bytes(&self) -> usize {
         self.lines
@@ -170,6 +175,7 @@ impl MeshData {
             .saturating_add(self.breaks.capacity().saturating_mul(std::mem::size_of::<[usize; 3]>()))
             .saturating_add(self.parts.iter().map(|(_, p)| p.cpu_bytes()).sum::<usize>())
             .saturating_add(self.instance.as_ref().map_or(0, blocks::InstanceData::bytes))
+            .saturating_add(self.glyphs.as_ref().map_or(0, text::InstanceData::bytes))
     }
 }
 
@@ -221,6 +227,7 @@ fn build_mesh_prims(list: &DisplayList, prims: &[cadcraft_render::DPrim], origin
         parts: Vec::new(),
         uploaded: None,
         instance: None,
+        glyphs: None,
     };
     for prim in prims {
         let col = premultiplied(prim.display_rgb(bg), prim.alpha());
@@ -413,6 +420,8 @@ struct Batch {
     bounds: Bounds2,
     opaque: bool,
     placements: Option<Arc<blocks::Placements>>,
+    spatial: Option<Arc<culling::Index>>,
+    glyphs: Option<Arc<text::Placements>>,
 }
 
 /// One uploaded mesh with its own view uniform (each callback's transform differs).
@@ -437,28 +446,35 @@ struct Layer {
 }
 
 impl Uploaded {
-    fn new(device: &wgpu::Device, m: &MeshData) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, m: &MeshData) -> Self {
         if let Some(uploaded) = &m.uploaded {
             return uploaded.clone();
         }
         if let Some(instance) = &m.instance {
-            return instance.upload(device);
+            return instance.upload(device, queue);
+        }
+        if let Some(glyphs) = &m.glyphs {
+            return glyphs.upload(device, queue);
         }
         if !m.parts.is_empty() {
             let mut result = Self { lines: Vec::new(), tris: Vec::new(), quads: Vec::new(), breaks: Vec::new(), bytes: 0 };
             for (_, part) in &m.parts {
-                result.append(Self::new(device, part));
+                result.append(Self::new(device, queue, part));
             }
             return result;
         }
         let usage = wgpu::BufferUsages::VERTEX;
-        Self {
+        let mut data = Self {
             lines: upload(device, "cad_lines", &m.lines, VERTEX_SIZE, usage),
             tris: upload(device, "cad_fills", &m.tris, VERTEX_SIZE, usage),
             quads: upload(device, "cad_quads", &m.quads, INSTANCE_SIZE, usage),
             breaks: m.breaks.clone(),
             bytes: m.bytes(),
-        }
+        };
+        data.bytes = data.bytes.saturating_add(
+            data.lines.iter().chain(&data.tris).chain(&data.quads).filter_map(|b| b.spatial.as_ref()).map(|i| i.bytes()).sum::<usize>(),
+        );
+        data
     }
 
     fn append(&mut self, part: Self) {
@@ -476,10 +492,10 @@ impl Uploaded {
 }
 
 impl Layer {
-    fn load(&mut self, device: &wgpu::Device, mesh: MeshData) {
+    fn load(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, mesh: MeshData) {
         self.active_parts.clear();
         if mesh.parts.is_empty() {
-            let data = Uploaded::new(device, &mesh);
+            let data = Uploaded::new(device, queue, &mesh);
             self.lines = data.lines;
             self.tris = data.tris;
             self.quads = data.quads;
@@ -499,7 +515,7 @@ impl Layer {
                 self.part_bytes = self.part_bytes.saturating_sub(data.bytes);
                 data
             } else {
-                std::sync::Arc::new(Uploaded::new(device, &m))
+                std::sync::Arc::new(Uploaded::new(device, queue, &m))
             };
             self.breaks.extend(data.breaks.iter().map(|b| [offset[0] + b[0], offset[1] + b[1], offset[2] + b[2]]));
             offset[0] += data.tris.iter().map(|b| b.count as usize).sum::<usize>();
@@ -558,6 +574,7 @@ struct Resources {
     tri_pipeline: wgpu::RenderPipeline,
     quad_pipeline: wgpu::RenderPipeline,
     block_pipeline: [wgpu::RenderPipeline; 3],
+    glyph_pipeline: [wgpu::RenderPipeline; 6],
     opaque_pipeline: [wgpu::RenderPipeline; 6],
     /// With a stencil buffer: the pipelines of [`Stencil::Mask`] and [`Stencil::Inside`].
     clipped: Option<ClipPipelines>,
@@ -585,6 +602,7 @@ struct View {
     e: vec4<f32>, // transform translation x, y (world, origin-relative)
 };
 @group(0) @binding(0) var<uniform> view: View;
+@group(1) @binding(0) var glyph_geometry: texture_2d<f32>;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
@@ -681,6 +699,38 @@ fn vs_block_quad(@builtin(vertex_index) vi: u32, @location(0) a: vec2<f32>,
     return wide_quad(vi % 6u, placed(a, m, t), placed(b, m, t), color, width, start);
 }
 
+struct GlyphIn {
+    @location(0) m: vec4<f32>,
+    @location(1) t: vec2<f32>,
+    @location(2) glyph: vec2<u32>,
+    @location(3) color: vec4<f32>,
+    @location(4) width: f32,
+};
+fn glyph_record(at: u32) -> vec4<f32> {
+    let width = textureDimensions(glyph_geometry, 0).x;
+    return textureLoad(glyph_geometry, vec2<i32>(i32(at % width), i32(at / width)), 0);
+}
+fn empty_glyph() -> VOut { return VOut(vec4<f32>(2.0, 2.0, 0.0, 1.0), vec4<f32>(0.0), 0.0); }
+@vertex
+fn vs_glyph_tri(@builtin(vertex_index) vi: u32, g: GlyphIn) -> VOut {
+    if (vi >= g.glyph.y) { return empty_glyph(); }
+    let p = placed(glyph_record(g.glyph.x + vi).xy, g.m, g.t);
+    return VOut(px_to_clip(to_px(p)), out_color(g.color), 0.0);
+}
+@vertex
+fn vs_glyph_line(@builtin(vertex_index) vi: u32, g: GlyphIn) -> VOut {
+    if (vi / 2u >= g.glyph.y) { return empty_glyph(); }
+    let segment = glyph_record(g.glyph.x + vi / 2u);
+    let p = placed(select(segment.xy, segment.zw, vi % 2u == 1u), g.m, g.t);
+    return VOut(px_to_clip(to_px(p)), out_color(g.color), 0.0);
+}
+@vertex
+fn vs_glyph_quad(@builtin(vertex_index) vi: u32, g: GlyphIn) -> VOut {
+    if (vi / 6u >= g.glyph.y) { return empty_glyph(); }
+    let segment = glyph_record(g.glyph.x + vi / 6u);
+    return wide_quad(vi % 6u, placed(segment.xy, g.m, g.t), placed(segment.zw, g.m, g.t), g.color, g.width, 0.0);
+}
+
 @fragment
 fn fs_main(v: VOut) -> @location(0) vec4<f32> {
     if (view.c.y > 0.0) {
@@ -723,6 +773,12 @@ impl Resources {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cad_canvas"),
             bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let glyph_bgl = text::layout(device);
+        let glyph_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cad_vector_glyphs"),
+            bind_group_layouts: &[Some(&bgl), Some(&glyph_bgl)],
             immediate_size: 0,
         });
         let layer = || {
@@ -779,7 +835,7 @@ impl Resources {
             |label: &str, vs: &str, topology: wgpu::PrimitiveTopology, buffer: wgpu::VertexBufferLayout<'static>, s: Stencil, opaque: bool| {
                 device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                     label: Some(label),
-                    layout: Some(&layout),
+                    layout: Some(if vs.starts_with("vs_glyph") { &glyph_layout } else { &layout }),
                     vertex: wgpu::VertexState {
                         module: &module,
                         entry_point: Some(vs),
@@ -814,6 +870,14 @@ impl Resources {
                 pipeline("cad_block_fills", "vs_block_line", TriangleList, vertex_layout(), Stencil::Off, false),
                 pipeline("cad_block_lines", "vs_block_line", LineList, vertex_layout(), Stencil::Off, false),
                 pipeline("cad_block_quads", "vs_block_quad", TriangleList, block_quad_layout(), Stencil::Off, false),
+            ],
+            glyph_pipeline: [
+                pipeline("cad_glyph_fills", "vs_glyph_tri", TriangleList, text::vertex_layout(), Stencil::Off, false),
+                pipeline("cad_glyph_lines", "vs_glyph_line", LineList, text::vertex_layout(), Stencil::Off, false),
+                pipeline("cad_glyph_quads", "vs_glyph_quad", TriangleList, text::vertex_layout(), Stencil::Off, false),
+                pipeline("cad_glyph_opaque_fills", "vs_glyph_tri", TriangleList, text::vertex_layout(), Stencil::Off, true),
+                pipeline("cad_glyph_opaque_lines", "vs_glyph_line", LineList, text::vertex_layout(), Stencil::Off, true),
+                pipeline("cad_glyph_opaque_quads", "vs_glyph_quad", TriangleList, text::vertex_layout(), Stencil::Off, true),
             ],
             opaque_pipeline: [
                 pipeline("cad_opaque_fills", "vs_line", TriangleList, vertex_layout(), Stencil::Off, true),
@@ -864,6 +928,8 @@ fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage
                 bounds: if finite { bounds } else { Bounds2::EMPTY },
                 opaque,
                 placements: None,
+                spatial: culling::Index::new(region, stride).map(Arc::new),
+                glyphs: None,
             });
         }
     }
@@ -1015,7 +1081,7 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
         if layer.key != Some(self.key) {
             let pending = self.slot.lock().ok().and_then(|mut s| s.take());
             if let Some(m) = pending {
-                layer.load(device, m);
+                layer.load(device, queue, m);
                 layer.key = Some(self.key);
                 changed = true;
             }
@@ -1102,6 +1168,29 @@ impl Resources {
             }
             let Some((normal, batches)) = lanes.get(draw.lane) else { continue };
             let Some(batch) = batches.get(draw.batch) else { continue };
+            if let Some(glyphs) = &batch.glyphs {
+                if callback.stencil != Stencil::Off {
+                    continue;
+                }
+                let Some(bind) = glyphs.bind() else { continue };
+                let Some(pipeline) = self.glyph_pipeline.get(draw.lane + if batch.opaque { 3 } else { 0 }) else { continue };
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(1, bind, &[]);
+                pass.set_vertex_buffer(0, batch.buffer.slice(..));
+                let mut first = None;
+                for (index, bounds) in glyphs.bounds.iter().enumerate().chain(std::iter::once((glyphs.bounds.len(), &Bounds2::EMPTY))) {
+                    let show = index < glyphs.bounds.len() && intersects(*bounds);
+                    if show && first.is_none() {
+                        first = Some(index as u32);
+                    }
+                    if !show && let Some(start) = first.take() {
+                        let vertices = if draw.lane == 2 { draw.range.start * 6..draw.range.end * 6 } else { draw.range.clone() };
+                        pass.draw(vertices, start..index as u32);
+                    }
+                }
+                previous = None;
+                continue;
+            }
             let instanced = batch.placements.is_some();
             if !instanced && !intersects(batch.bounds) {
                 continue;
@@ -1123,6 +1212,20 @@ impl Resources {
                 previous = Some(state);
             }
             pass.set_vertex_buffer(0, batch.buffer.slice(..));
+            if !instanced
+                && let (Some(index), Some(view)) = (&batch.spatial, visible)
+                && !view.contains_box(&batch.bounds)
+            {
+                for r in index.ranges(&view, draw.range.clone()) {
+                    let range = batch.first + r.start..batch.first + r.end;
+                    if draw.lane == 2 {
+                        pass.draw(0..6, range);
+                    } else {
+                        pass.draw(range, 0..1);
+                    }
+                }
+                continue;
+            }
             let mut range = batch.first + draw.range.start..batch.first + draw.range.end;
             // Joining adjacent visible ranges recovers one draw for a fully visible buffer.
             // A rejected range or a different material/placement remains an ordering boundary.
@@ -1138,6 +1241,7 @@ impl Resources {
                     || !same_instances
                     || range.end != other.first + next.range.start
                     || (!instanced && !intersects(other.bounds))
+                    || (!instanced && other.spatial.is_some() && visible.is_some_and(|view| !view.contains_box(&other.bounds)))
                 {
                     break;
                 }
@@ -1332,6 +1436,9 @@ mod tests {
                     (naga::ShaderStage::Vertex, "vs_quad"),
                     (naga::ShaderStage::Vertex, "vs_block_line"),
                     (naga::ShaderStage::Vertex, "vs_block_quad"),
+                    (naga::ShaderStage::Vertex, "vs_glyph_tri"),
+                    (naga::ShaderStage::Vertex, "vs_glyph_line"),
+                    (naga::ShaderStage::Vertex, "vs_glyph_quad"),
                     (naga::ShaderStage::Fragment, "fs_main"),
                 ],
             ),

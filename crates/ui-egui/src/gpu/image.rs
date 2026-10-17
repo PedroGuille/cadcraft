@@ -8,7 +8,7 @@ use super::*;
 
 pub struct CachedCanvasCallback {
     pub canvas: CanvasCallback,
-    pub parts: Arc<[(u64, Bounds2)]>,
+    pub parts: Arc<[cadcraft_render::screen::DamagePart]>,
     pub style: u64,
     pub clip: egui::Rect,
     pub navigation: bool,
@@ -26,7 +26,7 @@ pub(super) struct SceneImage {
     pipeline: wgpu::RenderPipeline,
     clear: wgpu::RenderPipeline,
     scratch: Option<wgpu::Texture>,
-    parts: Arc<[(u64, Bounds2)]>,
+    parts: Arc<[cadcraft_render::screen::DamagePart]>,
     image: Option<Texture>,
     source: Option<View>,
     key: u64,

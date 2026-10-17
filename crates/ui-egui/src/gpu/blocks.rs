@@ -13,18 +13,21 @@ pub struct Cache {
     entries: VecDeque<(Arc<DisplayList>, Rgb, bool, Arc<Geometry>)>,
     bytes: usize,
     limit: usize,
+    glyphs: text::Cache,
     weak: VecDeque<(std::sync::Weak<DisplayList>, Rgb, bool, std::sync::Weak<Geometry>)>,
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Self { entries: VecDeque::new(), bytes: 0, limit: 8 << 20, weak: VecDeque::new() }
+        Self { entries: VecDeque::new(), bytes: 0, limit: 6 << 20, glyphs: text::Cache::default(), weak: VecDeque::new() }
     }
 }
 
 impl Cache {
     pub fn set_budget(&mut self, bytes: usize) {
-        self.limit = bytes.min(8 << 20);
+        let bytes = bytes.min(8 << 20);
+        self.glyphs.set_budget(bytes / 3);
+        self.limit = bytes - bytes / 3;
         while self.bytes > self.limit {
             let Some((_, _, _, geometry)) = self.entries.pop_front() else { break };
             self.bytes = self.bytes.saturating_sub(geometry.retained);
@@ -32,7 +35,7 @@ impl Cache {
     }
 
     pub fn bytes(&self) -> usize {
-        self.bytes
+        self.bytes.saturating_add(self.glyphs.bytes())
     }
 
     fn geometry(&mut self, source: &Arc<DisplayList>, bg: Rgb, lw: bool) -> Option<Arc<Geometry>> {
@@ -104,10 +107,10 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn upload(&self, device: &wgpu::Device) -> &Uploaded {
+    fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> &Uploaded {
         self.uploaded.get_or_init(|| {
             let mesh = self.source.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take().unwrap_or_default();
-            let mut uploaded = Uploaded::new(device, &mesh);
+            let mut uploaded = Uploaded::new(device, queue, &mesh);
             // The quad stream is vertex-rate in a block pipeline. Counts/offsets in the rest
             // of the renderer remain in line segments, as for the ordinary quad stream.
             for batch in &mut uploaded.quads {
@@ -130,8 +133,8 @@ impl InstanceData {
         self.transforms.capacity().saturating_add(self.bounds.capacity() * std::mem::size_of::<Bounds2>())
     }
 
-    pub(super) fn upload(&self, device: &wgpu::Device) -> Uploaded {
-        let mut data = self.geometry.upload(device).clone();
+    pub(super) fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Uploaded {
+        let mut data = self.geometry.upload(device, queue).clone();
         let placements = Arc::new(Placements {
             buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("cad_block_placements"),
@@ -162,6 +165,7 @@ pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Ca
         return build_mesh(&part.list, origin, bg, lw);
     }
     let mut cache = cache.try_lock().ok();
+    let glyphs = cache.as_mut().map(|c| c.glyphs.prepare(&part.instances));
     let mut mesh = MeshData::default();
     let mut pending = DisplayList::default();
     let mut first = 0;
@@ -169,6 +173,14 @@ pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Ca
     while let Some(instance) = part.instances.get(at) {
         append_prims(&mut pending, &part.list, part.list.prims.get(first..instance.at).unwrap_or(&[]), cadcraft_geom::Mat3::IDENTITY, None);
         first = instance.at;
+        if instance.glyph
+            && let Some((data, count)) = glyphs.as_ref().and_then(|g| g.batch(&part.instances[at..], origin, bg, lw))
+        {
+            flush(&mut pending, &mut mesh, origin, bg, lw);
+            mesh.parts.push((0, Arc::new(MeshData { glyphs: Some(data), ..Default::default() })));
+            at += count;
+            continue;
+        }
         if instance.glyph
             && !part
                 .instances

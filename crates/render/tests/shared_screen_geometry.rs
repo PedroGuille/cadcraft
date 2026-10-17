@@ -113,3 +113,44 @@ fn selected_shared_geometry_stays_valid_after_optional_caches_are_trimmed() {
     let rebuilt = cache.build_scene(&d, &Space::Model, &Options::default()).scene;
     assert_eq!(scene.primitive_count(), rebuilt.primitive_count());
 }
+
+#[test]
+fn shared_drafting_glyphs_keep_decorations_transforms_and_distant_detail() {
+    let mut d = Drawing::new_imperial();
+    for i in 0..24 {
+        d.add(
+            &Space::Model,
+            Common::default(),
+            EntityKind::Text(Text {
+                insert: Vec3::new(f64::from(i) * 20.0, -10.0, 0.0),
+                align_pt: None,
+                height: 2.0,
+                value: "ROOM 101 %%uAB%%u %%d".into(),
+                rotation: f64::from(i % 4) * 0.3,
+                width_factor: if i % 2 == 0 { 0.8 } else { -1.2 },
+                oblique: 0.2,
+                style: "Standard".into(),
+                halign: HAlign::Left,
+                valign: VAlign::Baseline,
+            }),
+        )
+        .unwrap();
+    }
+    let drawing = Arc::new(d);
+    for pixel in [0.0, 0.1, 1.0, 4.0, 20.0] {
+        let options = Options { min_dash: pixel, ..Default::default() };
+        let full = build(&drawing, &Space::Model, &options);
+        let scene = Cache::default().build_scene(&drawing, &Space::Model, &options).scene;
+        let flat = scene.flatten();
+        assert_eq!(flat.prims.len(), full.prims.len());
+        for (a, b) in flat.prims.iter().zip(&full.prims) {
+            assert_eq!((a.handle, a.kind, a.color, a.lw), (b.handle, b.kind, b.color, b.lw));
+            assert_eq!(flat.points(a).len(), full.points(b).len());
+            for (p, q) in flat.points(a).iter().zip(full.points(b)) {
+                assert!(p.dist(*q) < 1e-9, "{pixel}: {p:?} != {q:?}");
+            }
+        }
+        assert!(scene.parts.iter().flat_map(|p| p.instances.iter()).any(|i| i.glyph));
+        assert!(scene.parts.iter().map(|p| p.list.verts.len()).sum::<usize>() < full.verts.len() / 2);
+    }
+}

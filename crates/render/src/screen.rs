@@ -30,6 +30,33 @@ pub struct Part {
     pub list: Arc<DisplayList>,
     /// Shared geometry, interleaved with ordinary primitives without expanding its vertices.
     pub instances: Arc<[BlockInstance]>,
+    pub damage: Option<Arc<Damage>>,
+}
+
+/// Rendered bounds of individual immutable entities. Keeping the source alive makes pointer
+/// identity safe even after undo, chunk compaction, and replacement of the drawing snapshot.
+pub struct EntityDamage {
+    pub source: Arc<Entity>,
+    pub bounds: cadcraft_geom::Bounds2,
+}
+
+pub struct Damage {
+    pub context: u64,
+    pub entities: Vec<EntityDamage>,
+}
+
+#[derive(Clone)]
+pub struct DamagePart {
+    pub id: u64,
+    pub bounds: cadcraft_geom::Bounds2,
+    pub details: Option<Arc<Damage>>,
+    pub origin: cadcraft_geom::Vec2,
+}
+
+impl Part {
+    pub fn damage_part(&self, origin: cadcraft_geom::Vec2) -> DamagePart {
+        DamagePart { id: self.id, bounds: self.list.bounds, details: self.damage.clone(), origin }
+    }
 }
 
 #[derive(Clone)]
@@ -83,7 +110,9 @@ impl Part {
     }
 
     fn bytes(&self) -> usize {
-        bytes(&self.list).saturating_add(self.instances.len().saturating_mul(std::mem::size_of::<BlockInstance>()))
+        bytes(&self.list)
+            .saturating_add(self.instances.len().saturating_mul(std::mem::size_of::<BlockInstance>()))
+            .saturating_add(self.damage.as_ref().map_or(0, |d| d.entities.capacity().saturating_mul(std::mem::size_of::<EntityDamage>())))
     }
 }
 
@@ -177,7 +206,7 @@ impl Geometry for Scene {
 
 impl Scene {
     pub fn from_list(list: DisplayList) -> Self {
-        Self::from_parts(vec![Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(list), instances: Arc::default() }])
+        Self::from_parts(vec![Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(list), instances: Arc::default(), damage: None }])
     }
     fn from_parts(parts: Vec<Part>) -> Self {
         let mut scene = Self { parts, ..Self::default() };
@@ -255,7 +284,8 @@ pub struct Cache {
     font_revision: u64,
     chunks: HashMap<usize, Part>,
     // Weak references reuse the active scene even when the retention budget is zero.
-    active: HashMap<usize, (u64, std::sync::Weak<DisplayList>, std::sync::Weak<[BlockInstance]>)>,
+    active: HashMap<usize, (u64, std::sync::Weak<DisplayList>, std::sync::Weak<[BlockInstance]>, std::sync::Weak<Damage>)>,
+    context: u64,
     limit: usize,
     templates: Arc<std::sync::Mutex<blocks::Templates>>,
 }
@@ -268,6 +298,7 @@ impl Default for Cache {
             font_revision: 0,
             chunks: HashMap::new(),
             active: HashMap::new(),
+            context: NEXT_PART.fetch_add(1, Ordering::Relaxed),
             limit: MAX_BYTES,
             templates: Default::default(),
         }
@@ -320,7 +351,7 @@ impl Cache {
         drawing
             .model
             .chunk_slices()
-            .filter(|(key, _)| !reusable || !(self.chunks.contains_key(key) || self.active.get(key).is_some_and(|(_, p, _)| p.strong_count() > 0)))
+            .filter(|(key, _)| !reusable || !(self.chunks.contains_key(key) || self.active.get(key).is_some_and(|(_, p, _, _)| p.strong_count() > 0)))
             .flat_map(|(_, ents)| ents)
             .fold(0usize, |work, e| {
                 work.saturating_add(match &e.kind {
@@ -361,13 +392,19 @@ impl Cache {
             self.chunks.clear();
             self.active.clear();
             self.templates = Default::default();
+            self.context = NEXT_PART.fetch_add(1, Ordering::Relaxed);
         }
         if let Ok(mut templates) = self.templates.lock() {
             templates.set_budget(self.limit / 4);
         }
-        for (&key, (id, weak, instances)) in &self.active {
+        for (&key, (id, weak, instances, damage)) in &self.active {
             if let Some(list) = weak.upgrade() {
-                self.chunks.entry(key).or_insert_with(|| Part { id: *id, list, instances: instances.upgrade().unwrap_or_default() });
+                self.chunks.entry(key).or_insert_with(|| Part {
+                    id: *id,
+                    list,
+                    instances: instances.upgrade().unwrap_or_default(),
+                    damage: damage.upgrade(),
+                });
             }
         }
         let chunks: Vec<_> = drawing.model.chunk_slices().collect();
@@ -390,12 +427,43 @@ impl Cache {
                 sharing: true,
                 instances: Vec::new(),
             };
+            let mut damage = Damage { context: self.context, entities: Vec::with_capacity(ents.len()) };
             for e in ents {
+                let first = b.list.prims.len();
+                let instance = b.instances.len();
                 if visible(drawing, e, &options) && !blocks::draw(&self.templates, &mut b, drawing, e) {
                     entity(&mut b, &top_ctx(drawing, Mat3::IDENTITY, e.handle, &[], &[]), e);
                 }
+                let mut bounds = cadcraft_geom::Bounds2::EMPTY;
+                let mut finite = true;
+                for p in b.list.prims.iter().skip(first).filter(|p| !matches!(p.kind, crate::Kind::Infinite { .. })) {
+                    for point in b.list.points(p) {
+                        if !point.is_finite() {
+                            finite = false;
+                            break;
+                        }
+                        bounds.add(*point);
+                    }
+                }
+                for i in b.instances.iter().skip(instance) {
+                    finite &= i.bounds == cadcraft_geom::Bounds2::EMPTY || (i.bounds.min.is_finite() && i.bounds.max.is_finite());
+                    bounds = bounds.union(&i.bounds);
+                }
+                if !finite {
+                    let invalid = cadcraft_geom::Vec2::new(f64::NAN, f64::NAN);
+                    bounds = cadcraft_geom::Bounds2 { min: invalid, max: invalid };
+                }
+                damage.entities.push(EntityDamage { source: e.clone(), bounds });
             }
-            (key, Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(b.list), instances: b.instances.into() })
+            (
+                key,
+                Part {
+                    id: NEXT_PART.fetch_add(1, Ordering::Relaxed),
+                    list: Arc::new(b.list),
+                    instances: b.instances.into(),
+                    damage: Some(Arc::new(damage)),
+                },
+            )
         };
         #[cfg(not(target_arch = "wasm32"))]
         let made: Vec<_> = {
@@ -421,7 +489,10 @@ impl Cache {
         self.active.clear();
         for (key, _) in chunks {
             let Some(part) = made.remove(&key).or_else(|| self.chunks.remove(&key)) else { return fallback(self) };
-            self.active.insert(key, (part.id, Arc::downgrade(&part.list), Arc::downgrade(&part.instances)));
+            self.active.insert(
+                key,
+                (part.id, Arc::downgrade(&part.list), Arc::downgrade(&part.instances), part.damage.as_ref().map(Arc::downgrade).unwrap_or_default()),
+            );
             parts.push(part.clone());
             let size = part.bytes();
             if size <= self.limit.saturating_sub(retained) {

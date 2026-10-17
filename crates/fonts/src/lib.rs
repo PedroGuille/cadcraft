@@ -213,7 +213,8 @@ pub fn shape_stroke(s: &str, height: f64, width_factor: f64, oblique: f64) -> Sh
 }
 
 /// Draw stroke-font glyph `spec` with its left edge at `x` (`sc` = text height / cap height).
-fn draw_stroke_glyph(out: &mut Shaped, spec: &str, x: f64, sc: f64, wf: f64, shear: f64) {
+fn draw_stroke_glyph(out: &mut Shaped, spec: &'static str, x: f64, sc: f64, wf: f64, shear: f64) {
+    let first = out.strokes.len();
     for st in stroke::strokes(spec) {
         let pts: Vec<Vec2> = st.iter().map(|(gx, gy)| Vec2::new(x + (gx * sc * wf) + gy * sc * shear, gy * sc)).collect();
         if pts.len() == 1 {
@@ -223,6 +224,15 @@ fn draw_stroke_glyph(out: &mut Shaped, spec: &str, x: f64, sc: f64, wf: f64, she
         } else {
             out.strokes.push(pts);
         }
+    }
+    if first < out.strokes.len() {
+        out.stroke_text.push(StrokeGlyph {
+            spec,
+            strokes: first..out.strokes.len(),
+            origin: Vec2::new(x, 0.0),
+            x: Vec2::new(sc * wf, 0.0),
+            y: Vec2::new(sc * shear, sc),
+        });
     }
 }
 
@@ -310,6 +320,35 @@ pub struct Shaped {
     /// The outline glyphs as font glyphs: which face and glyph each of [`Shaped::glyphs`] is,
     /// and where it sits.
     pub text: Vec<TextGlyph>,
+    /// Original drafting-font geometry and placement, alongside the compatibility polylines.
+    pub stroke_text: Vec<StrokeGlyph>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrokeGlyph {
+    pub spec: &'static str,
+    pub strokes: std::ops::Range<usize>,
+    pub origin: Vec2,
+    pub x: Vec2,
+    pub y: Vec2,
+}
+
+impl StrokeGlyph {
+    /// Original font units. Decorations and missing-glyph boxes remain ordinary strokes.
+    pub fn geometry(&self) -> Vec<Vec<Vec2>> {
+        stroke::strokes(self.spec)
+            .into_iter()
+            .map(|s| {
+                let mut points: Vec<_> = s.into_iter().map(|(x, y)| Vec2::new(x, y)).collect();
+                if points.len() == 1
+                    && let Some(p) = points.first().copied()
+                {
+                    points.push(p + Vec2::new(0.2, 0.0));
+                }
+                points
+            })
+            .collect()
+    }
 }
 
 /// A glyph of an installed outline font, placed: its outline is `Shaped::glyphs[outline]`.
@@ -342,6 +381,12 @@ impl Shaped {
     }
     /// Apply a point transform to every vertex (an affine map: text glyphs keep their axes).
     pub fn map(&mut self, f: impl Fn(Vec2) -> Vec2) {
+        for t in &mut self.stroke_text {
+            let o = f(t.origin);
+            t.x = f(t.origin + t.x) - o;
+            t.y = f(t.origin + t.y) - o;
+            t.origin = o;
+        }
         for t in &mut self.text {
             let o = f(t.origin);
             t.x = f(t.origin + t.x) - o;
@@ -364,6 +409,9 @@ impl Shaped {
     /// Append another shaped piece (already in the same coordinates).
     pub fn extend(&mut self, other: Shaped) {
         let base = self.glyphs.len();
+        let stroke_base = self.strokes.len();
+        self.stroke_text
+            .extend(other.stroke_text.into_iter().map(|t| StrokeGlyph { strokes: t.strokes.start + stroke_base..t.strokes.end + stroke_base, ..t }));
         self.text.extend(other.text.into_iter().map(|t| TextGlyph { outline: t.outline + base, ..t }));
         self.strokes.extend(other.strokes);
         self.glyphs.extend(other.glyphs);

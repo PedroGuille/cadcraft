@@ -33,13 +33,13 @@ fn callback(key: u64, edited: Option<f64>, offset: [f32; 2]) -> CachedCanvasCall
         if id == 1 {
             source.prims[0].transparency = 50;
         }
-        parts.push((id, source.bounds));
+        parts.push(cadcraft_render::screen::DamagePart { id, bounds: source.bounds, details: None, origin: Vec2::ZERO });
         mesh.parts.push((id, Arc::new(build_mesh(&source, Vec2::ZERO, Rgb(255, 255, 255), false))));
     }
     if let Some(x) = edited {
         let source = list(x, false);
         let id = x.to_bits();
-        parts.push((id, source.bounds));
+        parts.push(cadcraft_render::screen::DamagePart { id, bounds: source.bounds, details: None, origin: Vec2::ZERO });
         mesh.parts.push((id, Arc::new(build_mesh(&source, Vec2::ZERO, Rgb(255, 255, 255), false))));
     }
     let slot = Arc::new(Mutex::new(Some(mesh)));
@@ -296,4 +296,207 @@ fn attributed_array_bodies_and_styled_labels_match_the_flat_gpu_path() {
     same_pixels(&pixels, &render(&rs, &direct), "shared GPU geometry");
     assert_eq!(cache.lock().unwrap().bytes(), 0, "shared active buffers do not require cold retention");
     assert_eq!(faults.take(), None);
+}
+
+fn scene_callback(scene: &cadcraft_render::screen::Scene, cache: &Mutex<blocks::Cache>, key: u64, lw: bool) -> CachedCanvasCallback {
+    let mut cb = callback(key, None, [0.0, 0.0]);
+    let mut mesh = MeshData::default();
+    for part in &scene.parts {
+        mesh.parts.push((part.id, Arc::new(blocks::build_part(part, Vec2::ZERO, Rgb(255, 255, 255), lw, cache))));
+    }
+    cb.canvas.slot = Arc::new(Mutex::new(Some(mesh)));
+    cb.parts = scene.parts.iter().map(|p| p.damage_part(Vec2::ZERO)).collect();
+    cb
+}
+
+#[test]
+fn editing_one_entity_in_a_scattered_chunk_only_repaints_its_tiles() {
+    use cadcraft_doc::{Common, Drawing, EntityKind, Line, Space};
+    use cadcraft_geom::Vec3;
+    use cadcraft_render::screen::Cache;
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    let faults = Arc::new(GpuFaults::default());
+    install(&rs, &faults, None);
+    set_cache_budget(&rs, 12);
+    let mut d = Drawing::new_imperial();
+    let mut handle = Handle(0);
+    for i in 0..64 {
+        let x = if i == 0 { 80.0 } else { 1100.0 + f64::from(i % 8) * 5.0 };
+        let y = -100.0 - f64::from(i % 8) * 16.0;
+        let h = d
+            .add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::new(x, y, 0.0), b: Vec3::new(x + 20.0, y - 10.0, 0.0) }))
+            .unwrap();
+        if i == 0 {
+            handle = h;
+        }
+    }
+    let original = d.clone();
+    let mut scenes = Cache::default();
+    let meshes = Mutex::new(blocks::Cache::default());
+    let opts = cadcraft_render::Options::default();
+    let first = scenes.build_scene(&Arc::new(d.clone()), &Space::Model, &opts).scene;
+    assert_eq!(first.parts.len(), 1);
+    render(&rs, &scene_callback(&first, &meshes, 1000, false));
+    let mut previous = first;
+    for (key, x, tiles) in [(1001, Some(90.0), 1), (1002, Some(700.0), 2), (1003, None, 1), (1004, Some(80.0), 1)] {
+        if let Some(x) = x {
+            if key == 1004 {
+                d = original.clone();
+            } else {
+                let mut e = (**d.model.get(handle).unwrap()).clone();
+                e.kind = EntityKind::Line(Line { a: Vec3::new(x, -100.0, 0.0), b: Vec3::new(x + 20.0, -110.0, 0.0) });
+                assert!(d.model.replace(e));
+            }
+        } else {
+            d.model.remove(handle);
+        }
+        let scene = scenes.build_scene(&Arc::new(d.clone()), &Space::Model, &opts).scene;
+        let cb = scene_callback(&scene, &meshes, key, false);
+        let actual = render(&rs, &cb);
+        assert_eq!(dirty_count(&rs), tiles, "frame {key}");
+        let mut direct = callback(key + 100, None, [0.0, 0.0]).canvas;
+        direct.slot =
+            Arc::new(Mutex::new(Some(build_mesh(&cadcraft_render::build(&d, &Space::Model, &opts), Vec2::ZERO, Rgb(255, 255, 255), false))));
+        same_pixels(&actual, &render(&rs, &direct), "entity-level tile damage");
+        previous = scene;
+    }
+    assert_eq!(previous.parts.len(), 1);
+    assert_eq!(faults.take(), None);
+}
+
+#[test]
+fn spatial_culling_pixels_match_an_unculled_draw_with_transparency_and_wipeouts() {
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    let faults = Arc::new(GpuFaults::default());
+    install(&rs, &faults, None);
+    let mut source = DisplayList::default();
+    for i in 0..256 {
+        let x = if i % 2 == 0 { 20.0 + f64::from(i) * 3.0 } else { 10_000.0 };
+        let mut triangle = list(x, i == 64);
+        triangle.prims[0].start = source.tris.len() as u32;
+        if i % 3 == 0 {
+            triangle.prims[0].transparency = 50;
+        }
+        source.tris.extend(triangle.tris);
+        source.prims.extend(triangle.prims);
+    }
+    let mesh = build_mesh(&source, Vec2::ZERO, Rgb(255, 255, 255), false);
+    let mut unculled = Uploaded::new(&rs.device, &rs.queue, &mesh);
+    for batch in unculled.lines.iter_mut().chain(&mut unculled.tris).chain(&mut unculled.quads) {
+        batch.spatial = None;
+        batch.bounds = Bounds2::EMPTY;
+    }
+    let mut cb = callback(1100, None, [0.0, 0.0]).canvas;
+    cb.slot = Arc::new(Mutex::new(Some(mesh)));
+    let actual = render(&rs, &cb);
+    cb.key += 1;
+    cb.slot = Arc::new(Mutex::new(Some(MeshData { uploaded: Some(unculled), ..Default::default() })));
+    same_pixels(&actual, &render(&rs, &cb), "spatially culled draw order");
+    assert_eq!(faults.take(), None);
+}
+
+#[test]
+fn mixed_character_vector_batches_match_full_text_with_strokes_and_outline_fonts() {
+    use cadcraft_doc::{Common, Drawing, EntityKind, HAlign, Lineweight, Space, Text, Transparency, VAlign};
+    use cadcraft_geom::Vec3;
+    fn batched(mesh: &MeshData) -> bool {
+        mesh.glyphs.as_ref().is_some_and(|g| {
+            let (copies, letters) = g.counts();
+            copies > 8 && letters > 4
+        }) || mesh.parts.iter().any(|(_, p)| batched(p))
+    }
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    let faults = Arc::new(GpuFaults::default());
+    install(&rs, &faults, None);
+    let mut key = 1200;
+    for font in [cadcraft_fonts::BUILTIN_FONT, "DejaVuSans"] {
+        if font != cadcraft_fonts::BUILTIN_FONT && cadcraft_fonts::ttf::find(font).is_none() {
+            continue;
+        }
+        for wide in [false, true] {
+            let mut d = Drawing::new_imperial();
+            d.text_styles[0].font = font.into();
+            for row in 0..4 {
+                d.add(
+                    &Space::Model,
+                    Common {
+                        color: cadcraft_color::Color::Index(if row % 2 == 0 { 1 } else { 5 }),
+                        lineweight: Lineweight::Mm100(100),
+                        transparency: Transparency::Percent(50),
+                        ..Default::default()
+                    },
+                    EntityKind::Text(Text {
+                        insert: Vec3::new(40.0, -100.0 - f64::from(row) * 90.0, 0.0),
+                        align_pt: None,
+                        height: 30.0,
+                        value: "ROOM 123 + PUMP".into(),
+                        rotation: 0.0,
+                        width_factor: 1.0,
+                        oblique: 0.0,
+                        style: "Standard".into(),
+                        halign: HAlign::Left,
+                        valign: VAlign::Baseline,
+                    }),
+                )
+                .unwrap();
+            }
+            let d = Arc::new(d);
+            let options = cadcraft_render::Options { transparency: true, ..Default::default() };
+            let mut scenes = cadcraft_render::screen::Cache::default();
+            let scene = scenes.build_scene(&d, &Space::Model, &options).scene;
+            let cache = Mutex::new(blocks::Cache::default());
+            cache.lock().unwrap().set_budget(0);
+            let cb = scene_callback(&scene, &cache, key, wide);
+            assert!(batched(cb.canvas.slot.lock().unwrap().as_ref().unwrap()), "{font}: mixed letters share a GPU batch");
+            let actual = render(&rs, &cb.canvas);
+            cadcraft_render::trim_glyph_cache();
+            scenes.set_budget(0);
+            let mut direct = callback(key + 1, None, [0.0, 0.0]).canvas;
+            direct.slot =
+                Arc::new(Mutex::new(Some(build_mesh(&cadcraft_render::build(&d, &Space::Model, &options), Vec2::ZERO, Rgb(255, 255, 255), wide))));
+            same_pixels(&actual, &render(&rs, &direct), &format!("{font}, wide={wide}"));
+            key += 2;
+        }
+    }
+    assert_eq!(faults.take(), None);
+}
+
+#[test]
+fn a_single_outline_character_keeps_the_smaller_packed_upload() {
+    use cadcraft_doc::{Common, Drawing, EntityKind, HAlign, Space, Text, VAlign};
+    use cadcraft_geom::Vec3;
+    if cadcraft_fonts::ttf::find("DejaVuSans").is_none() {
+        return;
+    }
+    let mut d = Drawing::new_imperial();
+    d.text_styles[0].font = "DejaVuSans".into();
+    d.add(
+        &Space::Model,
+        Common::default(),
+        EntityKind::Text(Text {
+            insert: Vec3::ZERO,
+            align_pt: None,
+            height: 30.0,
+            value: "W".into(),
+            rotation: 0.0,
+            width_factor: 1.0,
+            oblique: 0.0,
+            style: "Standard".into(),
+            halign: HAlign::Left,
+            valign: VAlign::Baseline,
+        }),
+    )
+    .unwrap();
+    let scene = cadcraft_render::screen::Cache::default().build_scene(&Arc::new(d), &Space::Model, &Default::default()).scene;
+    let cache = Mutex::new(blocks::Cache::default());
+    let mesh = blocks::build_part(&scene.parts[0], Vec2::ZERO, Rgb(255, 255, 255), false, &cache);
+    fn packed_vertices(m: &MeshData) -> usize {
+        m.tri_vertices() + m.parts.iter().map(|(_, p)| packed_vertices(p)).sum::<usize>()
+    }
+    fn vector_page(m: &MeshData) -> bool {
+        m.glyphs.is_some() || m.parts.iter().any(|(_, p)| vector_page(p))
+    }
+    assert!(packed_vertices(&mesh) > 0);
+    assert!(!vector_page(&mesh), "an isolated outline should not allocate a vector texture page");
+    assert_eq!(cache.lock().unwrap().bytes(), 0);
 }

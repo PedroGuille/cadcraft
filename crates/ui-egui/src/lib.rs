@@ -311,6 +311,7 @@ impl CadApp {
     pub fn set_wgpu(&mut self, rs: &egui_wgpu::RenderState, stencil: Option<egui_wgpu::wgpu::TextureFormat>) {
         self.canvas.gpu = Some(gpu::install(rs, &self.gpu_faults, stencil));
         self.canvas.gpu_device = Some(rs.device.clone());
+        self.canvas.gpu_queue = Some(rs.queue.clone());
     }
 
     pub fn with_control(mut self, rx: Receiver<ControlRequest>) -> Self {
