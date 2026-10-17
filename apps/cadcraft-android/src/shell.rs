@@ -582,8 +582,8 @@ impl Shell {
         if !force && self.requested_cache_mib == self.cad.tablet_prefs.cache_mib && self.memory_at.elapsed() < Duration::from_secs(5) {
             return;
         }
-        // The requested allowance is an upper bound. The active drawing and undo remain intact;
-        // native memory and system headroom determine how much reusable geometry to retain.
+        // Retained rendering and history both follow system headroom. Exact live geometry is
+        // never discarded; history has its own bounded allowance shared across open drawings.
         let requested = self.cad.tablet_prefs.cache_mib;
         self.requested_cache_mib = requested;
         #[cfg(target_os = "android")]
@@ -593,10 +593,11 @@ impl Shell {
         #[cfg(not(target_os = "android"))]
         let mib = requested;
         self.memory_at = Instant::now();
+        self.cad.session.set_undo_memory_budget(((mib.saturating_mul(2).clamp(8, 64)) as usize) << 20);
         if force || self.cache_mib != mib {
             self.cache_mib = mib;
-            let gpu = mib / 4;
-            let spatial = mib / 4;
+            let gpu = mib * 2 / 3;
+            let spatial = mib / 6;
             let snap = (mib / 8).min(2);
             self.cad.session.set_snap_cache_budget((snap as usize) << 20);
             cadcraft_engine::spatial::set_cache_budget((spatial as usize) << 20);

@@ -6,7 +6,9 @@
 use crate::{DocState, Snapshot};
 
 /// The most undo steps a drawing keeps; the oldest are dropped first.
-pub const MAX_UNDO: usize = 2000;
+pub const MAX_UNDO: usize = 20;
+/// Additional storage retained by undo and redo, beyond live and saved geometry.
+pub const DEFAULT_MEMORY: usize = 32 << 20;
 /// The most marks a drawing keeps; the oldest are dropped first.
 const MAX_MARKS: usize = 1000;
 
@@ -25,6 +27,10 @@ pub enum Control {
 /// The UNDO settings and markers of one drawing.
 #[derive(Clone, Debug)]
 pub struct UndoCtl {
+    pub memory_limit: usize,
+    pub retained_bytes: usize,
+    ledger: cadcraft_doc::memory::MemoryLedger,
+    group_lost: bool,
     pub control: Control,
     /// UNDO Auto. Every command already records one undo step for all it does, so this is kept and
     /// reported (UNDOCTL) only.
@@ -42,7 +48,18 @@ pub struct UndoCtl {
 
 impl Default for UndoCtl {
     fn default() -> Self {
-        UndoCtl { control: Control::All, auto: true, combine_view: true, combine_layer: true, marks: Vec::new(), group: None }
+        UndoCtl {
+            memory_limit: DEFAULT_MEMORY,
+            retained_bytes: 0,
+            ledger: Default::default(),
+            group_lost: false,
+            control: Control::All,
+            auto: true,
+            combine_view: true,
+            combine_layer: true,
+            marks: Vec::new(),
+            group: None,
+        }
     }
 }
 
@@ -82,11 +99,14 @@ impl DocState {
         match self.undo_ctl.control {
             Control::None => {
                 self.undo.clear();
+                self.undo_ctl.retained_bytes = 0;
+                self.undo_ctl.ledger = Default::default();
                 return;
             }
             Control::One => {
                 self.undo.clear();
                 self.undo.push(snap);
+                self.trim_undo_memory();
                 return;
             }
             Control::All => {}
@@ -99,16 +119,73 @@ impl DocState {
         {
             self.undo_ctl.group = Some(depth);
         }
-        self.undo.push(snap);
-        if let Some(extra) = self.undo.len().checked_sub(MAX_UNDO).filter(|e| *e > 0) {
+        // An open group is one logical action, even when a script executes hundreds of
+        // commands. Keep its starting snapshot instead of letting the 20-step cap evict it.
+        if !self.undo_ctl.group_lost && self.undo_ctl.group.is_none_or(|start| self.undo.len() <= start) {
+            self.undo.push(snap);
+        }
+        self.trim_undo_memory();
+    }
+
+    /// Keep the newest reachable steps within both limits. Shared COW entities, chunks,
+    /// indexes, blocks and foreign data are counted once, including live/saved baselines.
+    pub fn trim_undo_memory(&mut self) {
+        if self.undo.is_empty() && self.redo.is_empty() {
+            self.undo_ctl.retained_bytes = 0;
+            self.undo_ctl.ledger = Default::default();
+            return;
+        }
+        let mut usage = self.undo_ctl.ledger.begin();
+        usage.exclude(&self.doc);
+        usage.exclude(&self.saved);
+        let mut retained = 0usize;
+        let mut keep_undo = 0;
+        let mut keep_redo = 0;
+        // Redo's nearest state is its last element, as is undo's. Keep the next available
+        // action in either direction first, then walk outwards without leaving gaps.
+        'steps: for i in 0..MAX_UNDO {
+            for (stack, keep) in [(&self.undo, &mut keep_undo), (&self.redo, &mut keep_redo)] {
+                if i != *keep {
+                    continue;
+                }
+                let Some(snap) = stack.len().checked_sub(i + 1).and_then(|at| stack.get(at)) else { continue };
+                let before = usage.bytes;
+                usage.drawing(&snap.doc);
+                let extra = usage
+                    .bytes
+                    .saturating_sub(before)
+                    .saturating_add(snap.label.capacity())
+                    .saturating_add(snap.selection.capacity() * std::mem::size_of::<cadcraft_doc::Handle>())
+                    .saturating_add(std::mem::size_of::<Snapshot>());
+                if extra <= self.undo_ctl.memory_limit.saturating_sub(retained) {
+                    retained = retained.saturating_add(extra);
+                    *keep += 1;
+                } else {
+                    // Once a snapshot cannot fit, its older neighbours cannot be reached.
+                    // Stop this measurement rather than allowing its visited allocations to
+                    // make the other stack look free.
+                    break 'steps;
+                }
+            }
+            if i >= keep_undo && i >= keep_redo {
+                break;
+            }
+        }
+        self.undo_ctl.retained_bytes = retained;
+        let extra = self.undo.len().saturating_sub(keep_undo);
+        if extra > 0 {
             self.undo.drain(..extra);
             for m in &mut self.undo_ctl.marks {
                 *m = m.saturating_sub(extra);
             }
             if let Some(g) = &mut self.undo_ctl.group {
+                self.undo_ctl.group_lost |= *g < extra;
                 *g = g.saturating_sub(extra);
             }
         }
+        let extra = self.redo.len().saturating_sub(keep_redo);
+        self.redo.drain(..extra);
+        self.undo_ctl.ledger.prune();
     }
 
     /// UNDO Mark at the current depth. Returns the number of marks.
@@ -133,6 +210,7 @@ impl DocState {
     /// group first (returns true then).
     pub fn begin_undo_group(&mut self) -> bool {
         let ended = self.end_undo_group();
+        self.undo_ctl.group_lost = false;
         self.undo_ctl.group = Some(self.undo.len());
         ended
     }
@@ -141,6 +219,7 @@ impl DocState {
     /// a group was open; End with no open group does nothing.
     pub fn end_undo_group(&mut self) -> bool {
         let Some(start) = self.undo_ctl.group.take() else { return false };
+        self.undo_ctl.group_lost = false;
         // The first step of the group holds the drawing as it was at BEgin.
         if self.undo.len() > start {
             self.undo.truncate(start + 1);
@@ -150,6 +229,7 @@ impl DocState {
         }
         // States inside the group no longer exist.
         self.undo_ctl.marks.retain(|m| *m <= start);
+        self.trim_undo_memory();
         true
     }
 
@@ -161,10 +241,12 @@ impl DocState {
             return;
         }
         self.undo_ctl.group = None;
+        self.undo_ctl.group_lost = false;
         self.undo_ctl.marks.clear();
         self.redo.clear();
         let keep = if c == Control::One { 1 } else { 0 };
         let drop = self.undo.len().saturating_sub(keep);
         self.undo.drain(..drop);
+        self.trim_undo_memory();
     }
 }

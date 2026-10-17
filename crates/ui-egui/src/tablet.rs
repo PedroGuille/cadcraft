@@ -21,6 +21,9 @@ pub struct Preferences {
     pub compact: bool,
     pub cache_mib: u32,
     pub recovery_seconds: u64,
+    pub simplify_navigation: bool,
+    pub reduced_navigation_resolution: bool,
+    pub navigation_fps: u32,
 }
 
 impl Default for Preferences {
@@ -34,6 +37,9 @@ impl Default for Preferences {
             compact: false,
             cache_mib: 24,
             recovery_seconds: 5,
+            simplify_navigation: true,
+            reduced_navigation_resolution: true,
+            navigation_fps: 30,
         }
     }
 }
@@ -43,6 +49,7 @@ impl Preferences {
         self.double_tap_ms = self.double_tap_ms.clamp(50, 500);
         self.cache_mib = self.cache_mib.clamp(8, 64);
         self.recovery_seconds = self.recovery_seconds.clamp(2, 60);
+        self.navigation_fps = self.navigation_fps.clamp(15, 60);
     }
     pub fn height(&self) -> f32 {
         if self.compact { 44.0 } else { 48.0 }
@@ -213,6 +220,9 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
             .id(egui::Id::new("tablet-settings"))
             .open(&mut app.tablet_settings_open)
             .resizable(false)
+            .vscroll(true)
+            .default_height(620.0)
+            .max_height((ui.ctx().content_rect().height() - 64.0).max(160.0))
             .show(ui.ctx(), |ui| {
                 ui.checkbox(&mut app.tablet_prefs.pen_only, crate::i18n::t("Draw with pen only"));
                 ui.checkbox(&mut app.tablet_prefs.double_tap_cancel, crate::i18n::t("Double tap to cancel"));
@@ -223,6 +233,12 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.double_tap_ms, 50..=500).text(crate::i18n::t("Double tap delay (ms)")));
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.cache_mib, 8..=64).text(crate::i18n::t("Render cache (MB)")));
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.recovery_seconds, 2..=60).text(crate::i18n::t("Recovery interval (s)")));
+                ui.separator();
+                ui.checkbox(&mut app.tablet_prefs.simplify_navigation, crate::i18n::t("Simplify while panning and zooming"));
+                ui.checkbox(&mut app.tablet_prefs.reduced_navigation_resolution, crate::i18n::t("Lower resolution while panning and zooming"));
+                ui.add(
+                    egui::Slider::new(&mut app.tablet_prefs.navigation_fps, 15..=60).text(crate::i18n::t("Drawing refresh during navigation (fps)")),
+                );
             });
     }
     let t = Tokens::get();

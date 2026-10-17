@@ -40,7 +40,7 @@ impl Xf {
 
 /// What a display list was built from: drawing uid, revision, tessellation band, hatch level of
 /// detail band, lineweight display, document and active viewport view (see [`ensure_list`]).
-type ListKey = (u64, u64, i32, i32, bool, bool, usize, u64, u64);
+type ListKey = (u64, u64, i32, i32, bool, bool, usize, u64, u64, bool);
 
 /// Whether two list keys are for the same drawing content (they may differ only in the view).
 fn same_content(a: &ListKey, b: &ListKey) -> bool {
@@ -49,6 +49,12 @@ fn same_content(a: &ListKey, b: &ListKey) -> bool {
 
 #[derive(Default)]
 pub struct CanvasState {
+    navigation_view: Option<(Vec2, f64)>,
+    navigation_until: f64,
+    navigation_preview: bool,
+    navigation_active: bool,
+    reduced_navigation_resolution: bool,
+    navigation_fps: u32,
     pub list: Option<cadcraft_render::screen::Scene>,
     key: ListKey,
     space: cadcraft_doc::Space,
@@ -58,6 +64,7 @@ pub struct CanvasState {
     cache_limit: Option<usize>,
     scenes: VecDeque<Scene>,
     part_meshes: HashMap<u64, Arc<crate::gpu::MeshData>>,
+    block_meshes: Arc<std::sync::Mutex<crate::gpu::blocks::Cache>>,
     selection: Selection,
     pub rebuilt_parts: usize,
     pub reused_parts: usize,
@@ -197,12 +204,15 @@ impl CanvasState {
     /// Bound reusable CPU geometry and inactive tabs together; the active list stays complete.
     pub fn set_cache_budget(&mut self, bytes: usize) {
         self.cache_limit = Some(bytes);
+        if let Ok(mut cache) = self.block_meshes.try_lock() {
+            cache.set_budget(bytes / 4);
+        }
         self.enforce_cache_budget();
     }
 
     fn enforce_cache_budget(&mut self) {
         let Some(limit) = self.cache_limit else { return };
-        let half = limit / 2;
+        let half = limit.saturating_sub(limit / 4) / 2;
         self.render_cache.set_budget(half);
         let mut mesh_bytes = 0usize;
         self.part_meshes.retain(|_, mesh| {
@@ -213,7 +223,8 @@ impl CanvasState {
             mesh_bytes = mesh_bytes.saturating_add(bytes);
             true
         });
-        let remaining = limit.saturating_sub(self.render_cache.bytes().saturating_add(mesh_bytes));
+        let blocks = self.block_meshes.try_lock().map_or(limit / 4, |c| c.bytes());
+        let remaining = limit.saturating_sub(self.render_cache.bytes().saturating_add(mesh_bytes).saturating_add(blocks));
         while self.scenes.iter().map(Scene::bytes).sum::<usize>() > remaining {
             self.scenes.pop_front();
         }
@@ -324,6 +335,7 @@ impl CanvasState {
         self.render_cache = Default::default();
         self.scenes.clear();
         self.part_meshes.clear();
+        self.block_meshes = Default::default();
         self.window = None;
         self.prim_index = Default::default();
         self.mesh_key = None;
@@ -462,6 +474,21 @@ fn prim_color32(prim: &cadcraft_render::DPrim, bg: Rgb) -> Color32 {
 /// background while the current list is drawn (see [`rebuild`]). Expensive edits use the same
 /// bounded worker; small edits and platforms without threads rebuild immediately.
 fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::Context) {
+    let now = ctx.input(|i| i.time);
+    let current = app.canvas.xf.map_or((xf.center, xf.scale), |active| (active.center, active.scale));
+    if app.tablet_mode && app.canvas.navigation_view.is_some_and(|old| old != current) {
+        app.canvas.navigation_until = now + 0.18;
+    }
+    app.canvas.navigation_view = Some(current);
+    let navigation = app.tablet_mode && now < app.canvas.navigation_until;
+    app.canvas.navigation_active = navigation;
+    app.canvas.reduced_navigation_resolution = app.tablet_prefs.reduced_navigation_resolution;
+    app.canvas.navigation_fps = app.tablet_prefs.navigation_fps;
+    if navigation {
+        ctx.request_repaint_after(std::time::Duration::from_secs_f64((app.canvas.navigation_until - now).max(0.001)));
+    }
+    let navigation = navigation && app.tablet_prefs.simplify_navigation;
+    app.canvas.navigation_preview = navigation;
     let px = 1.0 / xf.scale;
     let Ok(st) = app.session.state() else { return };
     // Rebuild when the drawing changes, the zoom moves by more than 2x (tessellation band) or a
@@ -469,6 +496,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     let band = |px: f64| px.max(1e-300).log2().floor() as i32;
     // Hatch level of detail follows the finest view showing the list.
     let lod_band = views.iter().map(|v| band(v.1)).fold(band(px), i32::min);
+    let curve_band = band(px).saturating_add(if navigation { 2 } else { 0 });
     // The active MSPACE viewport's contents are drawn apart (see `VpContent`), so panning and
     // zooming inside it leave this list alone. Without a stencil buffer a clipped viewport's
     // contents stay in the list, which then follows its view: realtime navigation changes it
@@ -489,13 +517,14 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     let key: ListKey = (
         st.uid,
         st.revision,
-        band(px),
+        curve_band,
         lod_band,
         lwdisplay,
         transparency_display,
         std::sync::Arc::as_ptr(&st.doc) as usize,
         vp_view,
         cadcraft_render::screen::font_revision(),
+        navigation,
     );
     app.canvas.scenes.retain(|s| app.session.docs.iter().any(|d| d.uid == s.key.0));
     if app.canvas.key.0 != st.uid || app.canvas.space != st.space {
@@ -573,7 +602,8 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
     app.canvas.job = None;
     let t0 = crate::now_ms();
     let opts = cadcraft_render::Options {
-        tolerance: 2f64.powi(band(px)) * 0.5,
+        navigation,
+        tolerance: 2f64.powi(curve_band) * 0.5,
         // Two pixels at the band's finest zoom: the list serves every zoom in the band, so its
         // level of detail must hold at the finest one.
         min_dash: 2f64.powi(lod_band) * 2.0,
@@ -597,6 +627,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
             lwdisplay,
             device: app.canvas.gpu_device.clone(),
             parts: app.canvas.part_meshes.clone(),
+            blocks: app.canvas.block_meshes.clone(),
         });
         let window = opts.view;
         let req = rebuild::Request { doc: st.doc.clone(), space: st.space.clone(), opts: opts.clone(), mesh, cache: app.canvas.render_cache.clone() };
@@ -652,7 +683,7 @@ struct VpContent {
     list: DisplayList,
     /// What the list was built from: drawing, revision, document, viewport, tessellation band
     /// and lineweight display.
-    key: Option<(u64, u64, usize, Handle, i32, bool, bool)>,
+    key: Option<(u64, u64, usize, Handle, i32, bool, bool, bool)>,
     /// The viewport's view (centre, height) the list was built for, and the paper area it covers.
     view: (Vec2, f64),
     area: Bounds2,
@@ -702,6 +733,7 @@ struct VpFrame {
 
 /// Build or reuse the active viewport's [`VpContent`] for this frame.
 fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Context) -> Option<VpFrame> {
+    let navigation = app.canvas.navigation_preview;
     let (lwdisplay, transparency) = (app.session.settings.lwdisplay, app.session.settings.transparency_display);
     let stencil = stencil_clip(app);
     let c = &mut app.canvas.vp;
@@ -718,8 +750,8 @@ fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Context) -> Op
         None => Bounds2::new(vp.center.xy() - half, vp.center.xy() + half),
     };
     let px = 1.0 / xf_paper.scale.max(1e-300);
-    let band = px.max(1e-300).log2().floor() as i32;
-    let key = (st.uid, st.revision, std::sync::Arc::as_ptr(&st.doc) as usize, h, band, lwdisplay, transparency);
+    let band = (px.max(1e-300).log2().floor() as i32).saturating_add(if navigation { 2 } else { 0 });
+    let key = (st.uid, st.revision, std::sync::Arc::as_ptr(&st.doc) as usize, h, band, lwdisplay, transparency, navigation);
     let now = crate::now_ms();
     let view = (vp.view_center, vp.view_height);
     if view != c.last_view {
@@ -745,6 +777,7 @@ fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Context) -> Op
         // only moves the geometry.
         let area = rect.expand(rect.width().max(rect.height()) * 0.5);
         let opts = cadcraft_render::Options {
+            navigation,
             tolerance: 2f64.powi(band) * 0.5,
             min_dash: 2f64.powi(band) * 2.0,
             text: true,
@@ -1233,14 +1266,14 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
             for part in &list.parts {
                 let id = part_mesh_key(part.id, origin, bg, lwdisplay);
                 let data = c.part_meshes.get(&id).cloned().unwrap_or_else(|| {
-                    let data = Arc::new(crate::gpu::build_mesh(&part.list, origin, bg, lwdisplay));
+                    let data = Arc::new(crate::gpu::blocks::build_part(part, origin, bg, lwdisplay, &c.block_meshes));
                     c.mesh_bytes = c.mesh_bytes.saturating_add(data.bytes());
                     data
                 });
                 next.insert(id, data.clone());
                 mesh.parts.push((id, data));
             }
-            let limit = c.cache_limit.map_or(32 << 20, |limit| limit / 2);
+            let limit = c.cache_limit.map_or(32 << 20, |limit| limit.saturating_sub(limit / 4) / 2);
             let mut retained = 0usize;
             next.retain(|_, mesh| {
                 let bytes = mesh.cpu_bytes();
@@ -1262,20 +1295,34 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
         c.mesh_ms = crate::now_ms() - t0;
     }
     let center = xf.rect.center();
-    p.add(egui_wgpu::Callback::new_paint_callback(
-        xf.rect,
-        crate::gpu::CanvasCallback {
-            key,
-            slot: c.mesh_slot.clone(),
-            offset: [(c.mesh_origin.x - xf.center.x) as f32, (c.mesh_origin.y - xf.center.y) as f32],
-            scale: xf.scale as f32,
-            center: [center.x, center.y],
-            layer: crate::gpu::LAYER_DRAWING,
-            xform: crate::gpu::IDENTITY_XFORM,
-            dash: 0.0,
-            stencil: crate::gpu::Stencil::Off,
-        },
-    ));
+    let callback = crate::gpu::CanvasCallback {
+        key,
+        slot: c.mesh_slot.clone(),
+        offset: [(c.mesh_origin.x - xf.center.x) as f32, (c.mesh_origin.y - xf.center.y) as f32],
+        scale: xf.scale as f32,
+        center: [center.x, center.y],
+        layer: crate::gpu::LAYER_DRAWING,
+        xform: crate::gpu::IDENTITY_XFORM,
+        dash: 0.0,
+        stencil: crate::gpu::Stencil::Off,
+    };
+    let callback = if c.cache_limit.is_some() {
+        egui_wgpu::Callback::new_paint_callback(
+            xf.rect,
+            crate::gpu::CachedCanvasCallback {
+                canvas: callback,
+                clip: p.clip_rect().intersect(xf.rect),
+                navigation: c.navigation_active,
+                reduced_resolution: c.reduced_navigation_resolution,
+                navigation_fps: c.navigation_fps,
+                time: p.ctx().input(|i| i.time),
+                context: p.ctx().clone(),
+            },
+        )
+    } else {
+        egui_wgpu::Callback::new_paint_callback(xf.rect, callback)
+    };
+    p.add(callback);
     let mut shapes = Vec::new();
     for (list, prim) in c.infinite.iter().filter_map(|i| list.primitive(*i)) {
         let pts = list.points(prim);

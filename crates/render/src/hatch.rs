@@ -23,6 +23,22 @@ fn is_set(cancel: Option<&AtomicBool>) -> bool {
 
 pub(super) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, h: &Hatch, rgb: Ink, lw: f32, tol: f64) {
     let loops = fill_loops(h, tol);
+    if b.opts.navigation && !b.plotting && h.gradient.is_some() {
+        b.tris(ctx, rgb, &fill::triangulate_evenodd(&loops));
+        return;
+    }
+    if b.opts.navigation && !b.plotting && !h.solid && !h.pattern.eq_ignore_ascii_case("SOLID") && h.gradient.is_none() {
+        // Boundaries preserve holes and orientation without generating thousands of pattern
+        // lines. Solid hatches and wipeouts continue to cover earlier geometry normally.
+        for boundary in &loops {
+            let mut closed = boundary.clone();
+            if let Some(&first) = boundary.first() {
+                closed.push(first);
+            }
+            b.polyline(ctx, rgb, lw, &closed);
+        }
+        return;
+    }
     // Gradient and background colours given ByLayer follow the hatch's own layer.
     let layer = if e.common.layer == "0" { ctx.block_layer.as_deref().unwrap_or("0") } else { e.common.layer.as_str() };
     let layer_color = ctx.layer_color(layer).unwrap_or(Color::Index(7));

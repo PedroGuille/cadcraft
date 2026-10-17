@@ -198,6 +198,8 @@ impl DisplayList {
 /// Build options.
 #[derive(Clone, Debug)]
 pub struct Options {
+    /// Temporary screen-only navigation preview. Never enabled by plotting or export callers.
+    pub navigation: bool,
     /// Chord tolerance in world units (about half a pixel at the current zoom).
     pub tolerance: f64,
     /// Two pixels in world units: shorter dashes are continuous and filled font text uses
@@ -239,6 +241,7 @@ impl Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
+            navigation: false,
             tolerance: 0.001,
             min_dash: 0.0,
             text: true,
@@ -342,6 +345,13 @@ impl Builder<'_> {
         if pts.len() < 2 {
             return;
         }
+        if !self.plotting && self.opts.min_dash > 0.0 && pts.len() > 4 && (!self.opts.lineweights || lw <= 0.0) {
+            let bounds = Bounds2::from_points(pts.iter().copied());
+            if bounds.width().max(bounds.height()) * max_scale(&ctx.xf) < self.opts.min_dash * 0.5 {
+                self.point(ctx, color, bounds.center());
+                return;
+            }
+        }
         self.note_pen(color);
         let (color, lw) = self.styled(color, lw);
         let start = self.list.verts.len() as u32;
@@ -389,6 +399,16 @@ impl Builder<'_> {
     }
     /// Shaped text: strokes as polylines; TrueType glyphs filled (TEXTFILL) or outlined.
     fn shaped(&mut self, ctx: &Ctx, color: Ink, lw: f32, sh: &cadcraft_fonts::Shaped) {
+        // Keep text's extent legible while navigating, without submitting every glyph outline.
+        // The full text is rebuilt at rest; the drawing and engine pick geometry are untouched.
+        if self.opts.navigation && !self.plotting && self.opts.min_dash > 0.0 {
+            let bounds = Bounds2::from_points(sh.strokes.iter().flatten().copied().chain(sh.glyphs.iter().flatten().flatten().copied()));
+            if !bounds.is_empty() {
+                let [a, b, c, d] = bounds.corners();
+                self.polyline(ctx, color, lw, &[a, b, c, d, a]);
+            }
+            return;
+        }
         for s in &sh.strokes {
             self.polyline(ctx, color, lw, s);
         }

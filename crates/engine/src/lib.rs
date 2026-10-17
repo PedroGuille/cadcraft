@@ -686,6 +686,15 @@ impl Session {
         self.snap_cache.set_budget(bytes);
     }
 
+    /// Share one undo/redo allowance across open drawings; favour the active drawing.
+    pub fn set_undo_memory_budget(&mut self, bytes: usize) {
+        let shares = self.docs.len().saturating_add(1).max(1);
+        for (index, state) in self.docs.iter_mut().enumerate() {
+            state.undo_ctl.memory_limit = (bytes / shares).saturating_mul(if index == self.active { 2 } else { 1 });
+            state.trim_undo_memory();
+        }
+    }
+
     pub fn new() -> Self {
         let mut s = Session::empty();
         s.new_drawing(false);
@@ -1627,6 +1636,7 @@ impl Session {
         st.follow_layout(&cur.doc);
         st.selection = Vec::new();
         st.redo.push(cur);
+        st.trim_undo_memory();
         st.revision += 1;
         Ok(Some(snap.label))
     }
@@ -1638,6 +1648,7 @@ impl Session {
         st.follow_layout(&cur.doc);
         st.selection = Vec::new();
         st.undo.push(cur);
+        st.trim_undo_memory();
         st.revision += 1;
         Ok(Some(snap.label))
     }

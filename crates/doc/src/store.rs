@@ -73,6 +73,28 @@ fn shard_of(h: Handle) -> usize {
 }
 
 impl EntityStore {
+    pub(crate) fn retained_memory(&self, usage: &mut crate::memory::MemoryUsage<'_>, entities: bool) {
+        use std::mem::size_of;
+        usage.add((self.chunks.capacity() + self.shards.capacity()) * size_of::<Arc<Chunk>>());
+        usage.allocation(&self.positions, self.positions.capacity().saturating_mul(size_of::<(u32, usize)>() + 8));
+        for shard in &self.shards {
+            usage.allocation(shard, shard.capacity().saturating_mul(size_of::<(Handle, u32)>() + 8));
+        }
+        for chunk in &self.chunks {
+            if usage.allocation(
+                chunk,
+                size_of::<Chunk>() + chunk.items.capacity() * size_of::<Arc<Entity>>() + chunk.associated.capacity() * size_of::<Handle>(),
+            ) {
+                usage.allocation(&chunk.slots, chunk.slots.capacity().saturating_mul(size_of::<(Handle, usize)>() + 8));
+                if entities {
+                    for entity in &chunk.items {
+                        usage.entity(entity);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self::default()
     }

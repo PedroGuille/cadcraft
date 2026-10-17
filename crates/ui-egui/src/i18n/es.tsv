@@ -1307,3 +1307,7 @@ tablet	Tablet Settings	Tablet
 	Immediate pen input	Entrada inmediata del lápiz
 	Place pen points immediately; double tap to cancel remains available for fingers	Coloca puntos con el lápiz al instante; el doble toque para cancelar sigue disponible con los dedos
 	Restore drawing	Restaurar dibujo
+
+	Simplify while panning and zooming	Simplificar al desplazar y ampliar
+	Lower resolution while panning and zooming	Reducir la resolución al desplazar y ampliar
+	Drawing refresh during navigation (fps)	Actualización del plano al navegar (fps)

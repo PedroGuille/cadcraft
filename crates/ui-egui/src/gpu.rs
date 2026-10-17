@@ -23,6 +23,10 @@ use cadcraft_render::{DisplayList, Kind};
 use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt;
 
+pub mod blocks;
+mod image;
+pub use image::CachedCanvasCallback;
+
 /// Line/triangle vertex: position (2 × f32, relative to the origin) + sRGB colour (4 × u8,
 /// premultiplied by its alpha: transparent objects blend with what is under them).
 const VERTEX_SIZE: usize = 12;
@@ -111,6 +115,7 @@ pub struct MeshData {
     /// Unchanged chunks keep their own vertex buffers. Their lanes are concatenated in list
     /// order; masks still split the complete scene, rather than drawing one chunk at a time.
     pub parts: Vec<(u64, std::sync::Arc<MeshData>)>,
+    instance: Option<blocks::InstanceData>,
     /// The vertex buffers already created from this data (see [`MeshData::upload_now`]); the
     /// paint callback then only swaps them in.
     uploaded: Option<Uploaded>,
@@ -131,17 +136,12 @@ impl MeshData {
     /// buffer zero-fills and copies it: about 0.35 s for a million-primitive drawing, which a
     /// background rebuild does off the UI thread (see `canvas::rebuild`).
     pub fn upload_now(&mut self, device: &wgpu::Device) {
-        let usage = wgpu::BufferUsages::VERTEX;
-        self.uploaded = Some(Uploaded {
-            breaks: self.breaks.clone(),
-            bytes: self.bytes(),
-            lines: upload(device, "cad_lines", &self.lines, VERTEX_SIZE, usage),
-            tris: upload(device, "cad_fills", &self.tris, VERTEX_SIZE, usage),
-            quads: upload(device, "cad_quads", &self.quads, INSTANCE_SIZE, usage),
-        });
+        self.uploaded = Some(Uploaded::new(device, self));
         self.lines = Vec::new();
         self.tris = Vec::new();
         self.quads = Vec::new();
+        self.parts = Vec::new();
+        self.instance = None;
     }
 
     pub fn line_vertices(&self) -> usize {
@@ -154,7 +154,12 @@ impl MeshData {
         self.quads.len() / INSTANCE_SIZE
     }
     pub fn bytes(&self) -> usize {
-        self.lines.len().saturating_add(self.tris.len()).saturating_add(self.quads.len())
+        self.lines
+            .len()
+            .saturating_add(self.tris.len())
+            .saturating_add(self.quads.len())
+            .saturating_add(self.parts.iter().map(|(_, p)| p.bytes()).sum::<usize>())
+            .saturating_add(self.instance.as_ref().map_or(0, blocks::InstanceData::bytes))
     }
     pub fn cpu_bytes(&self) -> usize {
         self.lines
@@ -162,6 +167,8 @@ impl MeshData {
             .saturating_add(self.tris.capacity())
             .saturating_add(self.quads.capacity())
             .saturating_add(self.breaks.capacity().saturating_mul(std::mem::size_of::<[usize; 3]>()))
+            .saturating_add(self.parts.iter().map(|(_, p)| p.cpu_bytes()).sum::<usize>())
+            .saturating_add(self.instance.as_ref().map_or(0, blocks::InstanceData::bytes))
     }
 }
 
@@ -201,6 +208,10 @@ fn premultiplied(c: Rgb, a: u8) -> [u8; 4] {
 
 /// Convert a display list into vertex data relative to `origin`, colours resolved against `bg`.
 pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) -> MeshData {
+    build_mesh_prims(list, &list.prims, origin, bg, lwdisplay)
+}
+
+fn build_mesh_prims(list: &DisplayList, prims: &[cadcraft_render::DPrim], origin: Vec2, bg: Rgb, lwdisplay: bool) -> MeshData {
     let mut m = MeshData {
         lines: Vec::with_capacity(list.segment_count().saturating_mul(2 * VERTEX_SIZE)),
         tris: Vec::with_capacity(list.tris.len().saturating_mul(VERTEX_SIZE)),
@@ -208,8 +219,9 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
         breaks: Vec::new(),
         parts: Vec::new(),
         uploaded: None,
+        instance: None,
     };
-    for prim in &list.prims {
+    for prim in prims {
         let col = premultiplied(prim.display_rgb(bg), prim.alpha());
         let pts = list.points(prim);
         match prim.kind {
@@ -395,6 +407,10 @@ pub const IDENTITY_XFORM: [f32; 6] = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 struct Batch {
     buffer: wgpu::Buffer,
     count: u32,
+    first: u32,
+    bounds: Bounds2,
+    opaque: bool,
+    placements: Option<Arc<blocks::Placements>>,
 }
 
 /// One uploaded mesh with its own view uniform (each callback's transform differs).
@@ -423,6 +439,16 @@ impl Uploaded {
         if let Some(uploaded) = &m.uploaded {
             return uploaded.clone();
         }
+        if let Some(instance) = &m.instance {
+            return instance.upload(device);
+        }
+        if !m.parts.is_empty() {
+            let mut result = Self { lines: Vec::new(), tris: Vec::new(), quads: Vec::new(), breaks: Vec::new(), bytes: 0 };
+            for (_, part) in &m.parts {
+                result.append(Self::new(device, part));
+            }
+            return result;
+        }
         let usage = wgpu::BufferUsages::VERTEX;
         Self {
             lines: upload(device, "cad_lines", &m.lines, VERTEX_SIZE, usage),
@@ -431,6 +457,19 @@ impl Uploaded {
             breaks: m.breaks.clone(),
             bytes: m.bytes(),
         }
+    }
+
+    fn append(&mut self, part: Self) {
+        let offset = [
+            self.tris.iter().map(|b| b.count as usize).sum::<usize>(),
+            self.lines.iter().map(|b| b.count as usize).sum(),
+            self.quads.iter().map(|b| b.count as usize).sum(),
+        ];
+        self.breaks.extend(part.breaks.iter().map(|b| [offset[0] + b[0], offset[1] + b[1], offset[2] + b[2]]));
+        self.lines.extend(part.lines);
+        self.tris.extend(part.tris);
+        self.quads.extend(part.quads);
+        self.bytes = self.bytes.saturating_add(part.bytes);
     }
 }
 
@@ -486,13 +525,24 @@ impl Layer {
         let lanes = [&self.tris, &self.lines, &self.quads];
         let all = lanes.map(|bs| bs.iter().map(|b| b.count as usize).sum::<usize>());
         let mut from = [0; 3];
+        let mut cursor = [0usize; 3];
+        let mut offset = [0usize; 3];
         for to in self.breaks.iter().copied().chain(std::iter::once(all)) {
             for (lane, batches) in lanes.iter().enumerate() {
-                self.draws.extend(batch_ranges(batches.iter().map(|b| b.count), from[lane]..to[lane]).into_iter().map(|(batch, range)| DrawSpan {
-                    lane,
-                    batch,
-                    range,
-                }));
+                let mut at = from[lane];
+                while at < to[lane] {
+                    let Some(batch) = batches.get(cursor[lane]) else { break };
+                    let end = offset[lane].saturating_add(batch.count as usize);
+                    let stop = end.min(to[lane]);
+                    if at < stop {
+                        self.draws.push(DrawSpan { lane, batch: cursor[lane], range: (at - offset[lane]) as u32..(stop - offset[lane]) as u32 });
+                    }
+                    if end <= to[lane] {
+                        offset[lane] = end;
+                        cursor[lane] += 1;
+                    }
+                    at = stop;
+                }
             }
             from = to;
         }
@@ -500,9 +550,13 @@ impl Layer {
 }
 
 struct Resources {
+    target: GpuTarget,
+    image: Option<image::SceneImage>,
     line_pipeline: wgpu::RenderPipeline,
     tri_pipeline: wgpu::RenderPipeline,
     quad_pipeline: wgpu::RenderPipeline,
+    block_pipeline: [wgpu::RenderPipeline; 3],
+    opaque_pipeline: [wgpu::RenderPipeline; 6],
     /// With a stencil buffer: the pipelines of [`Stencil::Mask`] and [`Stencil::Inside`].
     clipped: Option<ClipPipelines>,
     linear_out: bool,
@@ -567,14 +621,13 @@ fn vs_line(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>) -> VOut {
     return o;
 }
 
-@vertex
-fn vs_quad(
-    @builtin(vertex_index) vi: u32,
-    @location(0) a: vec2<f32>,
-    @location(1) b: vec2<f32>,
-    @location(2) color: vec4<f32>,
-    @location(3) width: f32,
-    @location(4) start: f32,
+fn wide_quad(
+    vi: u32,
+    a: vec2<f32>,
+    b: vec2<f32>,
+    color: vec4<f32>,
+    width: f32,
+    start: f32,
 ) -> VOut {
     let pa = to_px(a);
     let pb = to_px(b);
@@ -597,6 +650,35 @@ fn vs_quad(
     return o;
 }
 
+@vertex
+fn vs_quad(@builtin(vertex_index) vi: u32, @location(0) a: vec2<f32>,
+    @location(1) b: vec2<f32>, @location(2) color: vec4<f32>,
+    @location(3) width: f32, @location(4) start: f32) -> VOut {
+    return wide_quad(vi, a, b, color, width, start);
+}
+
+fn placed(p: vec2<f32>, m: vec4<f32>, t: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(m.x * p.x + m.z * p.y, m.y * p.x + m.w * p.y) + t;
+}
+
+@vertex
+fn vs_block_line(@location(0) pos: vec2<f32>, @location(1) color: vec4<f32>,
+    @location(5) m: vec4<f32>, @location(6) t: vec2<f32>) -> VOut {
+    var o: VOut;
+    o.pos = px_to_clip(to_px(placed(pos, m, t)));
+    o.color = out_color(color);
+    o.along = 0.0;
+    return o;
+}
+
+@vertex
+fn vs_block_quad(@builtin(vertex_index) vi: u32, @location(0) a: vec2<f32>,
+    @location(1) b: vec2<f32>, @location(2) color: vec4<f32>,
+    @location(3) width: f32, @location(4) start: f32,
+    @location(5) m: vec4<f32>, @location(6) t: vec2<f32>) -> VOut {
+    return wide_quad(vi % 6u, placed(a, m, t), placed(b, m, t), color, width, start);
+}
+
 @fragment
 fn fs_main(v: VOut) -> @location(0) vec4<f32> {
     if (view.c.y > 0.0) {
@@ -617,6 +699,12 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
 fn instance_layout() -> wgpu::VertexBufferLayout<'static> {
     const ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Unorm8x4, 3 => Float32, 4 => Float32];
     wgpu::VertexBufferLayout { array_stride: INSTANCE_SIZE as u64, step_mode: wgpu::VertexStepMode::Instance, attributes: &ATTRS }
+}
+
+fn block_quad_layout() -> wgpu::VertexBufferLayout<'static> {
+    let mut layout = instance_layout();
+    layout.step_mode = wgpu::VertexStepMode::Vertex;
+    layout
 }
 
 impl Resources {
@@ -685,43 +773,59 @@ impl Resources {
                 wgpu::DepthStencilState { format, depth_write_enabled: None, depth_compare: None, stencil, bias: wgpu::DepthBiasState::default() }
             })
         };
-        let pipeline = |label: &str, vs: &str, topology: wgpu::PrimitiveTopology, buffer: wgpu::VertexBufferLayout<'static>, s: Stencil| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&layout),
-                vertex: wgpu::VertexState {
-                    module: &module,
-                    entry_point: Some(vs),
-                    buffers: &[Some(buffer)],
-                    compilation_options: Default::default(),
-                },
-                primitive: wgpu::PrimitiveState { topology, ..Default::default() },
-                depth_stencil: stencil_state(s),
-                multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
-                fragment: Some(wgpu::FragmentState {
-                    module: &module,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target.format,
-                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
-                        write_mask: if s == Stencil::Mask { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
+        let pipeline =
+            |label: &str, vs: &str, topology: wgpu::PrimitiveTopology, buffer: wgpu::VertexBufferLayout<'static>, s: Stencil, opaque: bool| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&layout),
+                    vertex: wgpu::VertexState {
+                        module: &module,
+                        entry_point: Some(vs),
+                        buffers: &if vs.starts_with("vs_block") { vec![Some(buffer), Some(blocks::layout())] } else { vec![Some(buffer)] },
+                        compilation_options: Default::default(),
+                    },
+                    primitive: wgpu::PrimitiveState { topology, ..Default::default() },
+                    depth_stencil: stencil_state(s),
+                    multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &module,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: target.format,
+                            blend: (!opaque).then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                            write_mask: if s == Stencil::Mask { wgpu::ColorWrites::empty() } else { wgpu::ColorWrites::ALL },
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
         use wgpu::PrimitiveTopology::{LineList, TriangleList};
         Resources {
-            line_pipeline: pipeline("cad_lines", "vs_line", LineList, vertex_layout(), Stencil::Off),
-            tri_pipeline: pipeline("cad_fills", "vs_line", TriangleList, vertex_layout(), Stencil::Off),
-            quad_pipeline: pipeline("cad_quads", "vs_quad", TriangleList, instance_layout(), Stencil::Off),
+            target,
+            image: None,
+            line_pipeline: pipeline("cad_lines", "vs_line", LineList, vertex_layout(), Stencil::Off, false),
+            tri_pipeline: pipeline("cad_fills", "vs_line", TriangleList, vertex_layout(), Stencil::Off, false),
+            quad_pipeline: pipeline("cad_quads", "vs_quad", TriangleList, instance_layout(), Stencil::Off, false),
+            block_pipeline: [
+                pipeline("cad_block_fills", "vs_block_line", TriangleList, vertex_layout(), Stencil::Off, false),
+                pipeline("cad_block_lines", "vs_block_line", LineList, vertex_layout(), Stencil::Off, false),
+                pipeline("cad_block_quads", "vs_block_quad", TriangleList, block_quad_layout(), Stencil::Off, false),
+            ],
+            opaque_pipeline: [
+                pipeline("cad_opaque_fills", "vs_line", TriangleList, vertex_layout(), Stencil::Off, true),
+                pipeline("cad_opaque_lines", "vs_line", LineList, vertex_layout(), Stencil::Off, true),
+                pipeline("cad_opaque_quads", "vs_quad", TriangleList, instance_layout(), Stencil::Off, true),
+                pipeline("cad_opaque_block_fills", "vs_block_line", TriangleList, vertex_layout(), Stencil::Off, true),
+                pipeline("cad_opaque_block_lines", "vs_block_line", LineList, vertex_layout(), Stencil::Off, true),
+                pipeline("cad_opaque_block_quads", "vs_block_quad", TriangleList, block_quad_layout(), Stencil::Off, true),
+            ],
             clipped: target.stencil.map(|_| ClipPipelines {
-                mask: pipeline("cad_clip_mask", "vs_line", TriangleList, vertex_layout(), Stencil::Mask),
-                line: pipeline("cad_clip_lines", "vs_line", LineList, vertex_layout(), Stencil::Inside),
-                tri: pipeline("cad_clip_fills", "vs_line", TriangleList, vertex_layout(), Stencil::Inside),
-                quad: pipeline("cad_clip_quads", "vs_quad", TriangleList, instance_layout(), Stencil::Inside),
+                mask: pipeline("cad_clip_mask", "vs_line", TriangleList, vertex_layout(), Stencil::Mask, false),
+                line: pipeline("cad_clip_lines", "vs_line", LineList, vertex_layout(), Stencil::Inside, false),
+                tri: pipeline("cad_clip_fills", "vs_line", TriangleList, vertex_layout(), Stencil::Inside, false),
+                quad: pipeline("cad_clip_quads", "vs_quad", TriangleList, instance_layout(), Stencil::Inside, false),
             }),
             linear_out: target.format.is_srgb(),
             layers: (0..=LAYER_MASK).map(|_| layer()).collect(),
@@ -731,14 +835,37 @@ impl Resources {
 }
 
 fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage: wgpu::BufferUsages) -> Vec<Batch> {
-    bytes
-        .chunks(CHUNK * stride)
-        .filter(|c| c.len() >= stride)
-        .map(|c| Batch {
-            buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: c, usage }),
-            count: u32::try_from(c.len() / stride).unwrap_or(0),
-        })
-        .collect()
+    let mut batches = Vec::new();
+    for chunk in bytes.chunks(CHUNK * stride).filter(|c| c.len() >= stride) {
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: chunk, usage });
+        // Small conservative ranges can be rejected before submitting vertices, rather than
+        // relying on scissoring. Offsets share one buffer, with no extra GPU allocation.
+        for (index, region) in chunk.chunks(384 * stride).enumerate() {
+            let mut bounds = Bounds2::EMPTY;
+            let mut opaque = true;
+            let mut finite = true;
+            for vertex in region.chunks_exact(stride) {
+                for offset in if stride == INSTANCE_SIZE { &[0, 8][..] } else { &[0][..] } {
+                    if let Some(pair) = vertex.get(*offset..*offset + 8) {
+                        let mut values = pair.as_chunks::<4>().0.iter().map(|v| f32::from_le_bytes(*v));
+                        let point = Vec2::new(f64::from(values.next().unwrap_or(f32::NAN)), f64::from(values.next().unwrap_or(f32::NAN)));
+                        finite &= point.is_finite();
+                        bounds.add(point);
+                    }
+                }
+                opaque &= vertex.get(if stride == INSTANCE_SIZE { 19 } else { 11 }) == Some(&255);
+            }
+            batches.push(Batch {
+                buffer: buffer.clone(),
+                first: (index * 384) as u32,
+                count: (region.len() / stride) as u32,
+                bounds: if finite { bounds } else { Bounds2::EMPTY },
+                opaque,
+                placements: None,
+            });
+        }
+    }
+    batches
 }
 
 /// GPU trouble wgpu reported: uncaptured errors (validation, out of memory) and the device being
@@ -831,7 +958,8 @@ impl Layer {
 impl Resources {
     fn trim_retained(&mut self) {
         let mut bytes: usize = self.layers.iter().map(Layer::retained_bytes).sum();
-        while bytes > self.cache_limit {
+        let limit = self.cache_limit.saturating_sub(self.image.as_ref().map_or(0, image::SceneImage::bytes));
+        while bytes > limit {
             let Some(layer) = self.layers.iter_mut().max_by_key(|l| l.retained_bytes()) else { break };
             let Some(at) = layer.parts.iter().position(|(id, _)| !layer.active_parts.contains(id)) else { break };
             let Some((_, old)) = layer.parts.remove(at) else { break };
@@ -845,12 +973,16 @@ impl Resources {
 pub fn set_cache_budget(rs: &egui_wgpu::RenderState, mib: u32) {
     if let Some(resources) = rs.renderer.write().callback_resources.get_mut::<Resources>() {
         resources.cache_limit = (mib.min(64) as usize) << 20;
+        if resources.image.as_ref().is_some_and(|image| image.bytes() > resources.cache_limit) {
+            resources.image = None;
+        }
         resources.trim_retained();
     }
 }
 
 pub fn trim_cache(rs: &egui_wgpu::RenderState) {
     if let Some(resources) = rs.renderer.write().callback_resources.get_mut::<Resources>() {
+        resources.image = None;
         for layer in &mut resources.layers {
             layer.key = None;
             layer.lines.clear();
@@ -912,45 +1044,129 @@ impl egui_wgpu::CallbackTrait for CanvasCallback {
         if res.key != Some(self.key) {
             return;
         }
-        let [sw, sh] = info.screen_size_px;
+        shared.paint_layer(self, res, pass, info.screen_size_px, info.clip_rect);
+    }
+}
+
+impl CanvasCallback {
+    fn visible(&self, rect: egui::Rect) -> Option<Bounds2> {
+        use cadcraft_geom::Mat3;
+        let scale = f64::from(self.scale);
+        if !(scale.is_finite() && scale > 0.0) {
+            return None;
+        }
+        let [a, b, c, d, e, f] = self.xform.map(f64::from);
+        let inverse = Mat3 { a, b, c, d, e, f }.inverse()?;
+        let bounds = Bounds2::from_points([rect.left_top(), rect.right_top(), rect.left_bottom(), rect.right_bottom()].map(|p| {
+            inverse.apply(Vec2::new(
+                f64::from(p.x - self.center[0]) / scale - f64::from(self.offset[0]),
+                f64::from(self.center[1] - p.y) / scale - f64::from(self.offset[1]),
+            ))
+        }));
+        let magnitude = bounds.min.x.abs().max(bounds.min.y.abs()).max(bounds.max.x.abs()).max(bounds.max.y.abs());
+        // Include wide strokes, f32 placement rounding and affine overlay transforms.
+        let stretch = inverse.a.hypot(inverse.b).hypot(inverse.c.hypot(inverse.d)).max(1.0);
+        let margin = 32.0 / scale * stretch + magnitude * f64::from(f32::EPSILON) * 16.0;
+        (bounds.min.is_finite() && bounds.max.is_finite() && margin.is_finite()).then(|| bounds.expand(margin))
+    }
+}
+
+impl Resources {
+    fn paint_layer(&self, callback: &CanvasCallback, res: &Layer, pass: &mut wgpu::RenderPass<'_>, screen: [u32; 2], clip: egui::Rect) {
+        let [sw, sh] = screen;
         if sw == 0 || sh == 0 {
             return;
         }
-        // Whole-screen device pixels; egui already set the scissor to the canvas clip rect.
         pass.set_viewport(0.0, 0.0, sw as f32, sh as f32, 0.0, 1.0);
         pass.set_bind_group(0, &res.bind_group, &[]);
-        let (tri, line, quad) = match (self.stencil, &shared.clipped) {
-            (Stencil::Off, _) => (&shared.tri_pipeline, &shared.line_pipeline, &shared.quad_pipeline),
-            // The outline is all triangles.
+        let (tri, line, quad) = match (callback.stencil, &self.clipped) {
+            (Stencil::Off, _) => (&self.tri_pipeline, &self.line_pipeline, &self.quad_pipeline),
             (Stencil::Mask, Some(c)) => (&c.mask, &c.mask, &c.mask),
             (Stencil::Inside, Some(c)) => (&c.tri, &c.line, &c.quad),
-            // No stencil buffer: the canvas never asks for these.
             (_, None) => return,
         };
-        if self.stencil != Stencil::Off {
+        if callback.stencil != Stencil::Off {
             pass.set_stencil_reference(1);
         }
-        let mask = self.stencil == Stencil::Mask;
+        let mask = callback.stencil == Stencil::Mask;
         let lanes = [(tri, &res.tris), (line, &res.lines), (quad, &res.quads)];
-        let mut previous_lane = None;
-        for draw in &res.draws {
+        let visible = callback.visible(clip);
+        let intersects = |bounds: Bounds2| bounds.is_empty() || visible.is_none_or(|view| bounds.intersects(&view));
+        let mut previous = None;
+        let mut draws = res.draws.iter().peekable();
+        while let Some(draw) = draws.next() {
             if mask && draw.lane != 0 {
                 continue;
             }
-            let Some((pipeline, batches)) = lanes.get(draw.lane) else { continue };
+            let Some((normal, batches)) = lanes.get(draw.lane) else { continue };
             let Some(batch) = batches.get(draw.batch) else { continue };
-            if previous_lane != Some(draw.lane) {
+            let instanced = batch.placements.is_some();
+            if !instanced && !intersects(batch.bounds) {
+                continue;
+            }
+            let opaque = batch.opaque && callback.stencil == Stencil::Off;
+            let state = (draw.lane, instanced, opaque);
+            let pipeline = if opaque {
+                self.opaque_pipeline.get(draw.lane + if instanced { 3 } else { 0 })
+            } else if instanced && callback.stencil == Stencil::Off {
+                self.block_pipeline.get(draw.lane)
+            } else if !instanced {
+                Some(*normal)
+            } else {
+                None
+            };
+            let Some(pipeline) = pipeline else { continue };
+            if previous != Some(state) {
                 pass.set_pipeline(pipeline);
-                previous_lane = Some(draw.lane);
+                previous = Some(state);
             }
             pass.set_vertex_buffer(0, batch.buffer.slice(..));
-            if draw.lane == 2 { pass.draw(0..6, draw.range.clone()) } else { pass.draw(draw.range.clone(), 0..1) }
+            let mut range = batch.first + draw.range.start..batch.first + draw.range.end;
+            // Joining adjacent visible ranges recovers one draw for a fully visible buffer.
+            // A rejected range or a different material/placement remains an ordering boundary.
+            while let Some(next) = draws.peek().filter(|next| next.lane == draw.lane) {
+                let Some(other) = batches.get(next.batch) else { break };
+                let same_instances = match (&batch.placements, &other.placements) {
+                    (None, None) => true,
+                    (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+                    _ => false,
+                };
+                if other.buffer != batch.buffer
+                    || other.opaque != batch.opaque
+                    || !same_instances
+                    || range.end != other.first + next.range.start
+                    || (!instanced && !intersects(other.bounds))
+                {
+                    break;
+                }
+                range.end = other.first + next.range.end;
+                draws.next();
+            }
+            if let Some(placements) = &batch.placements {
+                pass.set_vertex_buffer(1, placements.buffer.slice(..));
+                let mut first = None;
+                for (index, bounds) in placements.bounds.iter().enumerate().chain(std::iter::once((placements.bounds.len(), &Bounds2::EMPTY))) {
+                    let show = index < placements.bounds.len() && intersects(*bounds);
+                    if show && first.is_none() {
+                        first = Some(index as u32);
+                    }
+                    if !show && let Some(start) = first.take() {
+                        let vertices = if draw.lane == 2 { range.start * 6..range.end * 6 } else { range.clone() };
+                        pass.draw(vertices, start..index as u32);
+                    }
+                }
+            } else if draw.lane == 2 {
+                pass.draw(0..6, range);
+            } else {
+                pass.draw(range, 0..1);
+            }
         }
     }
 }
 
 /// For batches holding `counts` vertices (or instances) each: the batch indices and the ranges
 /// within them that cover `range` of the batches laid end to end.
+#[cfg(test)]
 fn batch_ranges(counts: impl IntoIterator<Item = u32>, range: std::ops::Range<usize>) -> Vec<(usize, std::ops::Range<u32>)> {
     let mut out = Vec::new();
     let mut off = 0usize;
@@ -1106,18 +1322,31 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn shader_is_valid_for_webgpu_and_webgl2() {
-        let module = naga::front::wgsl::parse_str(SHADER).unwrap();
-        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module).unwrap();
-        for (stage, entry) in
-            [(naga::ShaderStage::Vertex, "vs_line"), (naga::ShaderStage::Vertex, "vs_quad"), (naga::ShaderStage::Fragment, "fs_main")]
-        {
-            let options = naga::back::glsl::Options { version: naga::back::glsl::Version::new_gles(300), ..Default::default() };
-            let pipeline = naga::back::glsl::PipelineOptions { shader_stage: stage, entry_point: entry.into(), multiview: None };
-            let mut out = String::new();
-            let mut w =
-                naga::back::glsl::Writer::new(&mut out, &module, &info, &options, &pipeline, naga::proc::BoundsCheckPolicies::default()).unwrap();
-            w.write().unwrap();
-            assert!(out.contains("#version 300 es"), "{entry}");
+        for (shader, entries) in [
+            (
+                SHADER,
+                vec![
+                    (naga::ShaderStage::Vertex, "vs_line"),
+                    (naga::ShaderStage::Vertex, "vs_quad"),
+                    (naga::ShaderStage::Vertex, "vs_block_line"),
+                    (naga::ShaderStage::Vertex, "vs_block_quad"),
+                    (naga::ShaderStage::Fragment, "fs_main"),
+                ],
+            ),
+            (image::SHADER, vec![(naga::ShaderStage::Vertex, "vs_image"), (naga::ShaderStage::Fragment, "fs_image")]),
+        ] {
+            let module = naga::front::wgsl::parse_str(shader).unwrap();
+            let info =
+                naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::empty()).validate(&module).unwrap();
+            for (stage, entry) in entries {
+                let options = naga::back::glsl::Options { version: naga::back::glsl::Version::new_gles(300), ..Default::default() };
+                let pipeline = naga::back::glsl::PipelineOptions { shader_stage: stage, entry_point: entry.into(), multiview: None };
+                let mut out = String::new();
+                let mut w =
+                    naga::back::glsl::Writer::new(&mut out, &module, &info, &options, &pipeline, naga::proc::BoundsCheckPolicies::default()).unwrap();
+                w.write().unwrap();
+                assert!(out.contains("#version 300 es"), "{entry}");
+            }
         }
     }
 

@@ -13,6 +13,7 @@ mod extents;
 mod gdt;
 mod header;
 pub mod library;
+pub mod memory;
 mod plotstyle;
 mod plotter;
 mod refedit;

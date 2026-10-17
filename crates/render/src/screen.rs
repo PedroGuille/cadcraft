@@ -28,6 +28,24 @@ pub struct Part {
     /// Identity of the tessellation, independent of its position in drawing order.
     pub id: u64,
     pub list: Arc<DisplayList>,
+    /// Shared block templates and their placements. The CPU list remains available for exact
+    /// highlights/picking; a GPU consumer can omit these copied primitive ranges.
+    pub instances: Arc<[BlockInstance]>,
+}
+
+#[derive(Clone)]
+pub struct BlockInstance {
+    pub template: Arc<DisplayList>,
+    pub transform: Mat3,
+    pub prims: std::ops::Range<usize>,
+    pub bounds: cadcraft_geom::Bounds2,
+    pub tolerance: f64,
+}
+
+impl Part {
+    fn bytes(&self) -> usize {
+        bytes(&self.list).saturating_add(self.instances.len().saturating_mul(std::mem::size_of::<BlockInstance>()))
+    }
 }
 
 /// An interactive scene keeps immutable chunks instead of copying all vertices after an edit.
@@ -87,7 +105,7 @@ impl Geometry for Scene {
 
 impl Scene {
     pub fn from_list(list: DisplayList) -> Self {
-        Self::from_parts(vec![Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(list) }])
+        Self::from_parts(vec![Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(list), instances: Arc::default() }])
     }
     fn from_parts(parts: Vec<Part>) -> Self {
         let mut scene = Self { parts, ..Self::default() };
@@ -100,7 +118,15 @@ impl Scene {
         scene
     }
     pub fn bytes(&self) -> usize {
-        self.parts.iter().map(|p| bytes(&p.list)).sum()
+        let mut templates = std::collections::HashSet::new();
+        self.parts
+            .iter()
+            .map(|part| {
+                part.bytes().saturating_add(
+                    part.instances.iter().filter(|i| templates.insert(Arc::as_ptr(&i.template) as usize)).map(|i| bytes(&i.template)).sum::<usize>(),
+                )
+            })
+            .sum()
     }
     /// Explicit compatibility/export operation; interactive drawing never flattens the scene.
     pub fn flatten(&self) -> DisplayList {
@@ -140,7 +166,7 @@ pub struct Cache {
     font_revision: u64,
     chunks: HashMap<usize, Part>,
     // Weak references reuse the active scene even when the retention budget is zero.
-    active: HashMap<usize, (u64, std::sync::Weak<DisplayList>)>,
+    active: HashMap<usize, (u64, std::sync::Weak<DisplayList>, std::sync::Weak<[BlockInstance]>)>,
     limit: usize,
     templates: Arc<std::sync::Mutex<blocks::Templates>>,
 }
@@ -163,7 +189,7 @@ impl Cache {
     pub fn bytes(&self) -> usize {
         // A worker may be tessellating a template: memory accounting must not stall the UI.
         let templates = self.templates.try_lock().map_or((self.limit / 4).min(8 << 20), |c| c.bytes);
-        self.chunks.values().map(|p| bytes(&p.list)).sum::<usize>().saturating_add(templates)
+        self.chunks.values().map(Part::bytes).sum::<usize>().saturating_add(templates)
     }
 
     /// Retain as many individual chunks as fit; the active drawing is never truncated.
@@ -184,7 +210,7 @@ impl Cache {
             0
         });
         self.chunks.retain(|_, part| {
-            let size = crate::screen::bytes(&part.list);
+            let size = part.bytes();
             if size > self.limit.saturating_sub(used) {
                 return false;
             }
@@ -205,7 +231,7 @@ impl Cache {
         drawing
             .model
             .chunk_slices()
-            .filter(|(key, _)| !reusable || !(self.chunks.contains_key(key) || self.active.get(key).is_some_and(|(_, p)| p.strong_count() > 0)))
+            .filter(|(key, _)| !reusable || !(self.chunks.contains_key(key) || self.active.get(key).is_some_and(|(_, p, _)| p.strong_count() > 0)))
             .flat_map(|(_, ents)| ents)
             .fold(0usize, |work, e| {
                 work.saturating_add(match &e.kind {
@@ -250,9 +276,9 @@ impl Cache {
         if let Ok(mut templates) = self.templates.lock() {
             templates.set_budget(self.limit / 4);
         }
-        for (&key, (id, weak)) in &self.active {
+        for (&key, (id, weak, instances)) in &self.active {
             if let Some(list) = weak.upgrade() {
-                self.chunks.entry(key).or_insert_with(|| Part { id: *id, list });
+                self.chunks.entry(key).or_insert_with(|| Part { id: *id, list, instances: instances.upgrade().unwrap_or_default() });
             }
         }
         let chunks: Vec<_> = drawing.model.chunk_slices().collect();
@@ -273,12 +299,13 @@ impl Cache {
                 shared_budget: Some(&budget),
                 transparency: 0,
             };
+            let mut instances = Vec::new();
             for e in ents {
-                if visible(drawing, e, &options) && !blocks::draw(&self.templates, &mut b, drawing, e) {
+                if visible(drawing, e, &options) && !blocks::draw(&self.templates, &mut b, drawing, e, &mut instances) {
                     entity(&mut b, &top_ctx(drawing, Mat3::IDENTITY, e.handle, &[], &[]), e);
                 }
             }
-            (key, Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(b.list) })
+            (key, Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(b.list), instances: instances.into() })
         };
         #[cfg(not(target_arch = "wasm32"))]
         let made: Vec<_> = {
@@ -304,9 +331,9 @@ impl Cache {
         self.active.clear();
         for (key, _) in chunks {
             let Some(part) = made.remove(&key).or_else(|| self.chunks.remove(&key)) else { return fallback(self) };
-            self.active.insert(key, (part.id, Arc::downgrade(&part.list)));
+            self.active.insert(key, (part.id, Arc::downgrade(&part.list), Arc::downgrade(&part.instances)));
             parts.push(part.clone());
-            let size = bytes(&part.list);
+            let size = part.bytes();
             if size <= self.limit.saturating_sub(retained) {
                 retained = retained.saturating_add(size);
                 next.insert(key, part);
@@ -321,7 +348,8 @@ impl Cache {
 }
 
 fn same_options(a: &Options, b: &Options) -> bool {
-    a.tolerance.to_bits() == b.tolerance.to_bits()
+    a.navigation == b.navigation
+        && a.tolerance.to_bits() == b.tolerance.to_bits()
         && a.min_dash.to_bits() == b.min_dash.to_bits()
         && a.text == b.text
         && a.fill == b.fill

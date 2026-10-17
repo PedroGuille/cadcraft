@@ -44,6 +44,7 @@ pub(super) struct MeshRequest {
     /// buffers (`None`: the paint callback uploads them).
     pub device: Option<egui_wgpu::wgpu::Device>,
     pub parts: std::collections::HashMap<u64, Arc<crate::gpu::MeshData>>,
+    pub blocks: Arc<std::sync::Mutex<crate::gpu::blocks::Cache>>,
 }
 
 /// A finished build.
@@ -131,7 +132,7 @@ fn run(mut req: Request) -> Option<Built> {
                 }
                 let id = super::part_mesh_key(part.id, origin, bg, m.lwdisplay);
                 let mesh = m.parts.get(&id).cloned().unwrap_or_else(|| {
-                    let mut mesh = crate::gpu::build_mesh(&part.list, origin, bg, m.lwdisplay);
+                    let mut mesh = crate::gpu::blocks::build_part(part, origin, bg, m.lwdisplay, &m.blocks);
                     if let Some(device) = &m.device {
                         mesh.upload_now(device);
                     }
@@ -250,6 +251,7 @@ mod tests {
                 lwdisplay: false,
                 device: None,
                 parts: Default::default(),
+                blocks: Default::default(),
             }),
         };
         let ctx = egui::Context::default();
