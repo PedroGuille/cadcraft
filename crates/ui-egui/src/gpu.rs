@@ -25,6 +25,7 @@ use egui_wgpu::wgpu::util::DeviceExt;
 
 pub mod blocks;
 mod image;
+mod tiles;
 pub use image::CachedCanvasCallback;
 
 /// Line/triangle vertex: position (2 × f32, relative to the origin) + sRGB colour (4 × u8,
@@ -283,8 +284,9 @@ pub fn build_highlight_mesh(
     dashed: bool,
 ) -> MeshData {
     let mut m = MeshData::default();
-    for (list, prim) in prims.iter().filter_map(|&i| list.primitive(i)) {
-        let pts = list.points(prim);
+    for primitive in prims.iter().filter_map(|&i| list.primitive(i)) {
+        let prim = &primitive.prim;
+        let pts = primitive.points();
         match prim.kind {
             Kind::Polyline => {
                 let mut run = 0.0;
@@ -310,7 +312,7 @@ pub fn build_highlight_mesh(
                 }
             }
             Kind::Tris | Kind::Mask => {
-                for line in list.fill_outlines(prim) {
+                for line in primitive.fill_outlines() {
                     let mut run = 0.0;
                     for s in line.windows(2) {
                         if let [a, b] = s {
@@ -1334,6 +1336,7 @@ mod tests {
                 ],
             ),
             (image::SHADER, vec![(naga::ShaderStage::Vertex, "vs_image"), (naga::ShaderStage::Fragment, "fs_image")]),
+            (image::CLEAR, vec![(naga::ShaderStage::Vertex, "vs_clear"), (naga::ShaderStage::Fragment, "fs_clear")]),
         ] {
             let module = naga::front::wgsl::parse_str(shader).unwrap();
             let info =

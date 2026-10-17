@@ -638,11 +638,48 @@ struct OutlineEntry {
     used: std::sync::atomic::AtomicBool,
     bytes: usize,
 }
-#[derive(Default)]
 struct GlyphCache {
     entries: HashMap<OutlineKey, OutlineEntry>,
     clock: std::collections::VecDeque<OutlineKey>,
     bytes: usize,
+    limit: usize,
+}
+
+impl Default for GlyphCache {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), clock: std::collections::VecDeque::new(), bytes: 0, limit: MAX_OUTLINE_BYTES }
+    }
+}
+
+impl GlyphCache {
+    fn trim(&mut self, additional: usize) {
+        let mut chances = self.clock.len();
+        while self.entries.len() >= MAX_CACHED_GLYPHS || self.bytes.saturating_add(additional) > self.limit {
+            let Some(old) = self.clock.pop_front() else { break };
+            if chances > 0 && self.entries.get(&old).is_some_and(|entry| entry.used.swap(false, std::sync::atomic::Ordering::Relaxed)) {
+                chances -= 1;
+                self.clock.push_back(old);
+                continue;
+            }
+            if let Some(entry) = self.entries.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+}
+
+/// Bound cold outlines retained across drawings; live shaped text remains valid.
+pub fn set_glyph_cache_budget(bytes: usize) {
+    let mut c = glyph_cache().write().unwrap_or_else(PoisonError::into_inner);
+    c.limit = bytes.min(MAX_OUTLINE_BYTES);
+    c.trim(0);
+}
+
+pub fn trim_glyph_cache() {
+    let mut c = glyph_cache().write().unwrap_or_else(PoisonError::into_inner);
+    c.entries.clear();
+    c.clock.clear();
+    c.bytes = 0;
 }
 
 fn glyph_cache() -> &'static RwLock<GlyphCache> {
@@ -773,17 +810,8 @@ fn outline(face: &Face, k: GlyphKey) -> Arc<GlyphOutline> {
         .fold(0usize, usize::saturating_add)
         .saturating_add(g.contours.len().saturating_mul(std::mem::size_of::<Vec<Vec2>>()))
         .saturating_add(std::mem::size_of::<OutlineEntry>());
-    if bytes <= MAX_OUTLINE_BYTES {
-        while cache.entries.len() >= MAX_CACHED_GLYPHS || cache.bytes.saturating_add(bytes) > MAX_OUTLINE_BYTES {
-            let Some(old) = cache.clock.pop_front() else { break };
-            if cache.entries.get(&old).is_some_and(|entry| entry.used.swap(false, std::sync::atomic::Ordering::Relaxed)) {
-                cache.clock.push_back(old);
-                continue;
-            }
-            if let Some(entry) = cache.entries.remove(&old) {
-                cache.bytes = cache.bytes.saturating_sub(entry.bytes);
-            }
-        }
+    if bytes <= cache.limit {
+        cache.trim(bytes);
         cache.bytes = cache.bytes.saturating_add(bytes);
         cache.clock.push_back(key);
         cache.entries.insert(key, OutlineEntry { outline: g.clone(), used: std::sync::atomic::AtomicBool::new(true), bytes });

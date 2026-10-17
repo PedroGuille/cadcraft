@@ -143,7 +143,7 @@ fn run(mut req: Request) -> Option<Built> {
             if req.opts.cancelled() {
                 return None;
             }
-            let infinite = list.primitives().enumerate().filter(|(_, (_, p))| matches!(p.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+            let infinite = list.primitives().enumerate().filter(|(_, p)| matches!(p.prim.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
             Some(BuiltMesh { data, origin, bg, lwdisplay: m.lwdisplay, infinite, ms: crate::now_ms() - t1 })
         }
     };

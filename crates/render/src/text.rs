@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, Weak};
 
 use cadcraft_fonts::{TextGlyph, ttf};
 use cadcraft_geom::{Bounds2, Mat3, Vec2};
@@ -27,9 +27,54 @@ enum Detail {
 
 type Key = (usize, usize, u32, u16, Detail);
 
-pub(super) struct Mesh {
+pub(crate) struct Mesh {
+    _face: ttf::Face,
     contours: Arc<[Vec<Vec2>]>,
     pub triangles: Vec<Vec2>,
+    templates: Mutex<Vec<(cadcraft_color::Rgb, bool, u8, Weak<crate::DisplayList>)>>,
+}
+
+impl Mesh {
+    pub(crate) fn bytes(&self) -> usize {
+        self.contours
+            .iter()
+            .map(Vec::capacity)
+            .sum::<usize>()
+            .saturating_add(self.triangles.capacity())
+            .saturating_mul(std::mem::size_of::<Vec2>())
+            .saturating_add(self.contours.len().saturating_mul(std::mem::size_of::<Vec<Vec2>>()))
+            .saturating_add(std::mem::size_of::<Self>())
+    }
+
+    pub(super) fn template(&self, color: cadcraft_color::Rgb, aci7: bool, transparency: u8) -> Arc<crate::DisplayList> {
+        let mut templates = self.templates.lock().unwrap_or_else(PoisonError::into_inner);
+        templates.retain(|(_, _, _, weak)| weak.strong_count() > 0);
+        if let Some(list) =
+            templates.iter().find_map(|(c, a, t, weak)| (*c == color && *a == aci7 && *t == transparency).then(|| weak.upgrade()).flatten())
+        {
+            return list;
+        }
+        let mut list =
+            crate::DisplayList { tris: self.triangles.clone(), bounds: Bounds2::from_points(self.triangles.iter().copied()), ..Default::default() };
+        if !list.tris.is_empty() {
+            list.prims.push(crate::DPrim {
+                handle: cadcraft_doc::Handle(0),
+                color,
+                aci7,
+                lw: 0.0,
+                transparency,
+                kind: crate::Kind::Tris,
+                start: 0,
+                len: list.tris.len() as u32,
+            });
+        }
+        let list = Arc::new(list);
+        if templates.len() >= 16 {
+            templates.remove(0);
+        }
+        templates.push((color, aci7, transparency, Arc::downgrade(&list)));
+        list
+    }
 }
 
 struct Entry {
@@ -40,11 +85,53 @@ struct Entry {
     bytes: usize,
 }
 
-#[derive(Default)]
 struct Cache {
     entries: HashMap<Key, Entry>,
     bytes: usize,
     clock: VecDeque<Key>,
+    limit: usize,
+    weak: HashMap<Key, Weak<Mesh>>,
+}
+
+impl Default for Cache {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), bytes: 0, clock: VecDeque::new(), limit: MAX_CACHE_BYTES, weak: HashMap::new() }
+    }
+}
+
+impl Cache {
+    fn trim(&mut self, additional: usize) {
+        let mut second_chances = self.clock.len();
+        while self.entries.len() >= MAX_ENTRIES || self.bytes.saturating_add(additional) > self.limit {
+            let Some(old) = self.clock.pop_front() else { break };
+            if second_chances > 0 && self.entries.get(&old).is_some_and(|entry| entry.used.swap(false, Ordering::Relaxed)) {
+                second_chances -= 1;
+                self.clock.push_back(old);
+                continue;
+            }
+            if let Some(entry) = self.entries.remove(&old) {
+                self.bytes = self.bytes.saturating_sub(entry.bytes);
+            }
+        }
+    }
+}
+
+/// Extra reusable glyph geometry; live templates referenced by a drawing remain valid.
+pub fn set_cache_budget(bytes: usize) {
+    let mut c = cache().write().unwrap_or_else(PoisonError::into_inner);
+    let bytes = bytes.min(MAX_CACHE_BYTES);
+    cadcraft_fonts::ttf::set_glyph_cache_budget(bytes / 3);
+    c.limit = bytes - bytes / 3;
+    c.trim(0);
+}
+
+pub fn trim_cache() {
+    cadcraft_fonts::ttf::trim_glyph_cache();
+    let mut c = cache().write().unwrap_or_else(PoisonError::into_inner);
+    c.entries.clear();
+    c.clock.clear();
+    c.bytes = 0;
+    c.weak.retain(|_, mesh| mesh.strong_count() > 0);
 }
 
 /// A read-write lock: display lists are built on all cores and nearly every lookup is a hit.
@@ -79,11 +166,14 @@ pub(super) fn mesh(g: &TextGlyph, xf: Mat3, pixel: f64) -> Arc<Mesh> {
         entry.used.store(true, Ordering::Relaxed);
         return entry.mesh.clone();
     }
+    if let Some(mesh) = cache().read().unwrap_or_else(PoisonError::into_inner).weak.get(&key).and_then(Weak::upgrade) {
+        return mesh;
+    }
     let contours = ttf::glyph_contours(&g.face, g.gid);
     let points = contours.iter().map(Vec::len).try_fold(0usize, usize::checked_add);
     // Font data is untrusted; don't hand unbounded or invalid paths to the tessellator.
     if !points.is_some_and(|n| n <= MAX_POINTS) || contours.iter().flatten().any(|p| !p.is_finite() || p.x.abs().max(p.y.abs()) > 1.0e6) {
-        return Arc::new(Mesh { contours: Arc::default(), triangles: Vec::new() });
+        return Arc::new(Mesh { _face: g.face.clone(), contours: Arc::default(), triangles: Vec::new(), templates: Mutex::default() });
     }
     let contours = match detail {
         Detail::Full => contours,
@@ -97,30 +187,35 @@ pub(super) fn mesh(g: &TextGlyph, xf: Mat3, pixel: f64) -> Arc<Mesh> {
             }
         }
     };
-    let mesh = Arc::new(Mesh { triangles: triangulate(&contours), contours });
+    let mesh = Arc::new(Mesh { _face: g.face.clone(), triangles: triangulate(&contours), contours, templates: Mutex::default() });
     let points = mesh.contours.iter().map(Vec::capacity).sum::<usize>().saturating_add(mesh.triangles.capacity());
     let bytes = points
         .saturating_mul(std::mem::size_of::<Vec2>())
         .saturating_add(mesh.contours.len().saturating_mul(std::mem::size_of::<Vec<Vec2>>()))
-        .saturating_add(std::mem::size_of::<Entry>() + std::mem::size_of::<Key>() + std::mem::size_of::<Mesh>());
-    if bytes <= MAX_CACHE_BYTES {
-        let mut c = cache().write().unwrap_or_else(PoisonError::into_inner);
-        if !c.entries.contains_key(&key) {
-            while c.entries.len() >= MAX_ENTRIES || c.bytes.saturating_add(bytes) > MAX_CACHE_BYTES {
-                let Some(old) = c.clock.pop_front() else { break };
-                if c.entries.get(&old).is_some_and(|entry| entry.used.swap(false, Ordering::Relaxed)) {
-                    c.clock.push_back(old);
-                    continue;
-                }
-                if let Some(entry) = c.entries.remove(&old) {
-                    c.bytes = c.bytes.saturating_sub(entry.bytes);
-                }
-            }
-            c.bytes = c.bytes.saturating_add(bytes);
-            c.clock.push_back(key);
-            c.entries.insert(key, Entry { _face: g.face.clone(), mesh: mesh.clone(), used: AtomicBool::new(true), bytes });
-        }
+        .saturating_add(std::mem::size_of::<Entry>() + std::mem::size_of::<Key>() + std::mem::size_of::<Mesh>())
+        .saturating_add(16 * std::mem::size_of::<(cadcraft_color::Rgb, bool, u8, Weak<crate::DisplayList>)>());
+    let mut c = cache().write().unwrap_or_else(PoisonError::into_inner);
+    if let Some(existing) = c.entries.get(&key) {
+        existing.used.store(true, Ordering::Relaxed);
+        return existing.mesh.clone();
     }
+    if let Some(existing) = c.weak.get(&key).and_then(Weak::upgrade) {
+        return existing;
+    }
+    let weak_limit = (c.limit / 1024).clamp(128, MAX_ENTRIES);
+    if c.weak.len() >= weak_limit {
+        c.weak.retain(|_, mesh| mesh.strong_count() > 0);
+    }
+    if c.weak.len() < weak_limit {
+        c.weak.insert(key, Arc::downgrade(&mesh));
+    }
+    if bytes <= c.limit {
+        c.trim(bytes);
+        c.bytes = c.bytes.saturating_add(bytes);
+        c.clock.push_back(key);
+        c.entries.insert(key, Entry { _face: g.face.clone(), mesh: mesh.clone(), used: AtomicBool::new(true), bytes });
+    }
+
     mesh
 }
 

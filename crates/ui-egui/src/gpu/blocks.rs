@@ -13,11 +13,12 @@ pub struct Cache {
     entries: VecDeque<(Arc<DisplayList>, Rgb, bool, Arc<Geometry>)>,
     bytes: usize,
     limit: usize,
+    weak: VecDeque<(std::sync::Weak<DisplayList>, Rgb, bool, std::sync::Weak<Geometry>)>,
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Self { entries: VecDeque::new(), bytes: 0, limit: 8 << 20 }
+        Self { entries: VecDeque::new(), bytes: 0, limit: 8 << 20, weak: VecDeque::new() }
     }
 }
 
@@ -41,6 +42,12 @@ impl Cache {
             self.entries.push_back(entry);
             return Some(geometry);
         }
+        self.weak.retain(|(s, _, _, geometry)| s.strong_count() > 0 && geometry.strong_count() > 0);
+        if let Some(geometry) = self.weak.iter().find_map(|(s, color, weight, geometry)| {
+            (s.ptr_eq(&Arc::downgrade(source)) && *color == bg && *weight == lw).then(|| geometry.upgrade()).flatten()
+        }) {
+            return Some(geometry);
+        }
         if source.prims.iter().any(|p| matches!(p.kind, Kind::Mask | Kind::Infinite { .. })) {
             return None;
         }
@@ -54,7 +61,7 @@ impl Cache {
         let quad_bytes = mesh.quads.len().checked_mul(6)?;
         let bytes = mesh.lines.len().checked_add(mesh.tris.len())?.checked_add(quad_bytes)?;
         let retained = bytes.checked_add(cadcraft_render::screen::bytes(source))?;
-        if retained > self.limit || bytes == 0 {
+        if bytes == 0 {
             return None;
         }
         let quads = std::mem::take(&mut mesh.quads);
@@ -71,6 +78,13 @@ impl Cache {
             source: Mutex::new(Some(mesh)),
             uploaded: OnceLock::new(),
         });
+        if self.weak.len() >= 4096 {
+            self.weak.pop_front();
+        }
+        self.weak.push_back((Arc::downgrade(source), bg, lw, Arc::downgrade(&geometry)));
+        if retained > self.limit {
+            return Some(geometry);
+        }
         while self.bytes.saturating_add(retained) > self.limit || self.entries.len() >= 128 {
             let Some((_, _, _, old)) = self.entries.pop_front() else { break };
             self.bytes = self.bytes.saturating_sub(old.retained);
@@ -125,6 +139,7 @@ impl InstanceData {
                 usage: wgpu::BufferUsages::VERTEX,
             }),
             bounds: self.bounds.clone(),
+            _geometry: self.geometry.clone(),
         });
         for batch in data.tris.iter_mut().chain(&mut data.lines).chain(&mut data.quads) {
             batch.placements = Some(placements.clone());
@@ -135,22 +150,38 @@ impl InstanceData {
 }
 
 pub(super) struct Placements {
+    _geometry: Arc<Geometry>,
     pub buffer: wgpu::Buffer,
     pub bounds: Vec<Bounds2>,
 }
 
-/// Convert a scene part without duplicating shared GPU geometry. CPU copies of the display
-/// list are still used for highlights and the CPU fallback, independently of this mesh.
+/// Convert shared CPU geometry directly to shared GPU buffers. Precision-sensitive or
+/// over-budget placements expand only while building their fallback upload, never in the scene.
 pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Cache>) -> MeshData {
     if part.instances.is_empty() {
         return build_mesh(&part.list, origin, bg, lw);
     }
-    let Ok(mut cache) = cache.try_lock() else { return build_mesh(&part.list, origin, bg, lw) };
+    let mut cache = cache.try_lock().ok();
     let mut mesh = MeshData::default();
+    let mut pending = DisplayList::default();
     let mut first = 0;
     let mut at = 0;
     while let Some(instance) = part.instances.get(at) {
-        let Some(geometry) = cache.geometry(&instance.template, bg, lw) else {
+        append_prims(&mut pending, &part.list, part.list.prims.get(first..instance.at).unwrap_or(&[]), cadcraft_geom::Mat3::IDENTITY, None);
+        first = instance.at;
+        if instance.glyph
+            && !part
+                .instances
+                .get(at + 1)
+                .is_some_and(|next| Arc::ptr_eq(&next.template, &instance.template) && next.prims.start == instance.prims.end)
+        {
+            append_instance(&mut pending, instance);
+            at += 1;
+            continue;
+        }
+        let geometry = cache.as_mut().and_then(|c| c.geometry(&instance.template, bg, lw));
+        let Some(geometry) = geometry else {
+            append_instance(&mut pending, instance);
             at += 1;
             continue;
         };
@@ -164,23 +195,48 @@ pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Ca
             last = next.prims.end;
             end += 1;
         }
-        // A lone instance would add draw calls without amortising the extra vertex stream.
-        // Leave it in the regular mesh; non-adjacent templates can still share tessellation.
-        if end.saturating_sub(at) < 2 {
+        // A single glyph is cheaper in the ordinary upload than as an individual draw call.
+        // Block bodies still share buffers when their unique attributes interrupt the run.
+        if end == at || (instance.glyph && end.saturating_sub(at) < 2) {
+            append_instance(&mut pending, instance);
             at += 1;
             continue;
         }
-        if let Some(prims) = part.list.prims.get(first..instance.prims.start).filter(|p| !p.is_empty()) {
-            mesh.parts.push((0, Arc::new(build_mesh_prims(&part.list, prims, origin, bg, lw))));
-        }
+        flush(&mut pending, &mut mesh, origin, bg, lw);
         mesh.parts.push((0, Arc::new(MeshData { instance: Some(data), ..Default::default() })));
-        first = last;
         at = end;
     }
-    if let Some(prims) = part.list.prims.get(first..).filter(|p| !p.is_empty()) {
-        mesh.parts.push((0, Arc::new(build_mesh_prims(&part.list, prims, origin, bg, lw))));
-    }
+    append_prims(&mut pending, &part.list, part.list.prims.get(first..).unwrap_or(&[]), cadcraft_geom::Mat3::IDENTITY, None);
+    flush(&mut pending, &mut mesh, origin, bg, lw);
     mesh
+}
+
+fn append_instance(dst: &mut DisplayList, instance: &BlockInstance) {
+    append_prims(dst, &instance.template, &instance.template.prims, instance.transform, Some(instance.handle));
+}
+
+fn append_prims(
+    dst: &mut DisplayList,
+    src: &DisplayList,
+    prims: &[cadcraft_render::DPrim],
+    xf: cadcraft_geom::Mat3,
+    handle: Option<cadcraft_doc::Handle>,
+) {
+    for source in prims {
+        let mut p = *source;
+        let target = if matches!(p.kind, Kind::Tris | Kind::Mask) { &mut dst.tris } else { &mut dst.verts };
+        p.start = target.len() as u32;
+        p.handle = handle.unwrap_or(p.handle);
+        target.extend(src.points(source).iter().map(|p| xf.apply(*p)));
+        dst.prims.push(p);
+    }
+}
+
+fn flush(pending: &mut DisplayList, mesh: &mut MeshData, origin: Vec2, bg: Rgb, lw: bool) {
+    if !pending.prims.is_empty() {
+        mesh.parts.push((0, Arc::new(build_mesh(pending, origin, bg, lw))));
+        *pending = DisplayList::default();
+    }
 }
 
 fn placement(data: &mut InstanceData, instance: &BlockInstance, origin: Vec2) -> bool {

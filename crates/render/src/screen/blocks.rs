@@ -10,6 +10,7 @@ pub(super) struct Templates {
     pub bytes: usize,
     limit: usize,
     eligible: std::collections::HashMap<String, Option<bool>>,
+    weak: Vec<(cadcraft_doc::Common, Insert, u64, std::sync::Weak<DisplayList>)>,
 }
 
 impl Templates {
@@ -23,12 +24,17 @@ impl Templates {
 
     fn get(&mut self, d: &Drawing, e: &Entity, options: &Options) -> Option<(Arc<DisplayList>, Mat3)> {
         let EntityKind::Insert(ins) = &e.kind else { return None };
-        if self.limit == 0 || cadcraft_doc::is_annotative(e) || !e.common.xdata.is_empty() || !single(ins) || !ins.insert.xy().is_finite() {
+        if cadcraft_doc::is_annotative(e) || !e.common.xdata.is_empty() || !finite(ins) || !ins.insert.xy().is_finite() {
             return None;
         }
         let mut local = ins.clone();
         local.insert.x = 0.0;
         local.insert.y = 0.0;
+        local.attribs.clear();
+        local.cols = 1;
+        local.rows = 1;
+        local.col_spacing = 0.0;
+        local.row_spacing = 0.0;
         let classify = || {
             let mut budget = 4096;
             eligible(d, &ins.block, 0, &mut budget).then(|| affine_block(d, &ins.block, 0))
@@ -61,6 +67,14 @@ impl Templates {
         if let Some((_, _, _, list)) = self.entries.iter().find(|(common, key, tol, _)| *common == e.common && *key == local && *tol == band) {
             return Some((list.clone(), transform));
         }
+        self.weak.retain(|(_, _, _, list)| list.strong_count() > 0);
+        if let Some(list) = self
+            .weak
+            .iter()
+            .find_map(|(common, key, tol, list)| (*common == e.common && *key == local && *tol == band).then(|| list.upgrade()).flatten())
+        {
+            return Some((list, transform));
+        }
         let template = Entity { handle: e.handle, common: e.common.clone(), kind: EntityKind::Insert(local.clone()) };
         // Eligible leaves have no view-dependent geometry or draw-order masks.
         let options = Options { tolerance, min_dash: options.min_dash / stretch, view: None, ..options.clone() };
@@ -71,14 +85,21 @@ impl Templates {
         let bytes = super::bytes(&list);
         if self.entries.len() < 128 && bytes <= self.limit.saturating_sub(self.bytes) {
             self.bytes = self.bytes.saturating_add(bytes);
-            self.entries.push((e.common.clone(), local, band, list.clone()));
+            self.entries.push((e.common.clone(), local.clone(), band, list.clone()));
+        }
+        if self.weak.len() < 128 {
+            self.weak.push((e.common.clone(), local, band, Arc::downgrade(&list)));
         }
         Some((list, transform))
     }
 }
 
 fn single(i: &Insert) -> bool {
-    i.cols <= 1 && i.rows <= 1 && i.attribs.is_empty() && i.scale.x.is_finite() && i.scale.y.is_finite() && i.rotation.is_finite()
+    i.cols <= 1 && i.rows <= 1 && i.attribs.is_empty() && finite(i)
+}
+
+fn finite(i: &Insert) -> bool {
+    i.scale.x.is_finite() && i.scale.y.is_finite() && i.rotation.is_finite() && i.row_spacing.is_finite() && i.col_spacing.is_finite()
 }
 
 fn eligible(d: &Drawing, name: &str, depth: usize, budget: &mut usize) -> bool {
@@ -111,45 +132,47 @@ fn eligible(d: &Drawing, name: &str, depth: usize, budget: &mut usize) -> bool {
 }
 
 /// True when handled (including a fully offscreen instance); false requests the full builder.
-pub(super) fn draw(
-    templates: &std::sync::Mutex<Templates>,
-    b: &mut Builder<'_>,
-    d: &Drawing,
-    e: &Entity,
-    instances: &mut Vec<super::BlockInstance>,
-) -> bool {
-    let EntityKind::Insert(_) = &e.kind else { return false };
+pub(super) fn draw(templates: &std::sync::Mutex<Templates>, b: &mut Builder<'_>, d: &Drawing, e: &Entity) -> bool {
+    let EntityKind::Insert(ins) = &e.kind else { return false };
     if d.is_hidden_object(e.handle) || b.opts.cancelled() {
         return true;
     }
-    let Some((list, transform)) = templates.lock().ok().and_then(|mut cache| cache.get(d, e, b.opts)) else { return false };
-    if !b.expand_by(list.expanded) {
-        return false;
-    }
-    let bounds = if list.bounds.is_empty() { Bounds2::EMPTY } else { Bounds2::from_points(list.bounds.corners().map(|p| transform.apply(p))) };
-    let lw = list.prims.iter().map(|p| f64::from(p.lw.max(0.0))).fold(0.0, f64::max);
-    let magnitude = bounds.min.x.abs().max(bounds.max.x.abs()).max(bounds.min.y.abs()).max(bounds.max.y.abs());
-    let margin = b.opts.tolerance.abs() * (lw * 8.0 + 16.0) + magnitude * f64::EPSILON * 128.0;
-    if let Some(view) = b.opts.view.filter(|v| !v.is_empty() && v.min.is_finite() && v.max.is_finite())
-        && !bounds.is_empty()
-        && bounds.min.is_finite()
-        && bounds.max.is_finite()
-        && margin.is_finite()
-        && !bounds.expand(margin).intersects(&view)
-    {
+    let ctx = crate::top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]);
+    let (rgb, _, _, _, shown, layer_t) = crate::resolve(&ctx, e, false);
+    if !shown {
         return true;
     }
-    let first = b.list.prims.len();
-    let (verts, tris) = (b.list.verts.len() as u32, b.list.tris.len() as u32);
-    b.list.prims.extend(list.prims.iter().copied().map(|mut p| {
-        p.handle = e.handle;
-        p.start += if matches!(p.kind, crate::Kind::Tris | crate::Kind::Mask) { tris } else { verts };
-        p
-    }));
-    b.list.verts.extend(list.verts.iter().map(|p| transform.apply(*p)));
-    b.list.tris.extend(list.tris.iter().map(|p| transform.apply(*p)));
-    b.list.bounds = b.list.bounds.union(&bounds);
-    instances.push(super::BlockInstance { template: list, transform, prims: first..b.list.prims.len(), bounds, tolerance: b.opts.tolerance });
+    let Some((list, transform)) = templates.lock().ok().and_then(|mut cache| cache.get(d, e, b.opts)) else { return false };
+    'copies: for row in 0..ins.rows.clamp(1, 10_000) {
+        for col in 0..ins.cols.clamp(1, 10_000) {
+            if b.opts.cancelled() || !b.expand_by(list.expanded) {
+                break 'copies;
+            }
+            // MINSERT spacing rotates with the reference, but is not multiplied by its scale.
+            let offset = cadcraft_geom::Vec2::new(ins.col_spacing * f64::from(col), ins.row_spacing * f64::from(row)).rotate(ins.rotation);
+            let xf = Mat3::translate(offset).then_before(transform);
+            let bounds = if list.bounds.is_empty() { Bounds2::EMPTY } else { Bounds2::from_points(list.bounds.corners().map(|p| xf.apply(p))) };
+            let lw = list.prims.iter().map(|p| f64::from(p.lw.max(0.0))).fold(0.0, f64::max);
+            let magnitude = bounds.min.x.abs().max(bounds.max.x.abs()).max(bounds.min.y.abs()).max(bounds.max.y.abs());
+            let margin = b.opts.tolerance.abs() * (lw * 8.0 + 16.0) + magnitude * f64::EPSILON * 128.0;
+            if let Some(view) = b.opts.view.filter(|v| !v.is_empty() && v.min.is_finite() && v.max.is_finite())
+                && !bounds.is_empty()
+                && bounds.min.is_finite()
+                && bounds.max.is_finite()
+                && margin.is_finite()
+                && !bounds.expand(margin).intersects(&view)
+            {
+                continue;
+            }
+            b.instance(list.clone(), xf, e.handle, None);
+        }
+    }
+    // Attributes are stored in world coordinates and follow the complete array body, exactly
+    // as on the full renderer. Their individual visibility, styles and transparency still resolve.
+    let saved = b.transparency;
+    b.transparency = if b.opts.transparency { crate::transparency(e.common.transparency, layer_t, 0) } else { 0 };
+    crate::attributes(b, &ctx, e, ins, rgb);
+    b.transparency = saved;
     true
 }
 

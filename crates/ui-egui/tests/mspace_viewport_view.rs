@@ -76,8 +76,8 @@ fn in_layout_list(h: &Harness<'_, CadApp>) -> Bounds2 {
     let list = h.state().canvas.list.as_ref().expect("a display list");
     use cadcraft_render::screen::Geometry;
     list.primitives()
-        .filter(|(_, p)| p.handle == VIEWPORT_CONTENT)
-        .fold(Bounds2::EMPTY, |b, (list, p)| b.union(&Bounds2::from_points(list.points(p).iter().copied())))
+        .filter(|p| p.prim.handle == VIEWPORT_CONTENT)
+        .fold(Bounds2::EMPTY, |b, p| b.union(&Bounds2::from_points(p.points().iter().copied())))
 }
 
 fn revision(h: &Harness<'_, CadApp>) -> u64 {

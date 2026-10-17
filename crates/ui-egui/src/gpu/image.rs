@@ -8,6 +8,8 @@ use super::*;
 
 pub struct CachedCanvasCallback {
     pub canvas: CanvasCallback,
+    pub parts: Arc<[(u64, Bounds2)]>,
+    pub style: u64,
     pub clip: egui::Rect,
     pub navigation: bool,
     pub reduced_resolution: bool,
@@ -22,11 +24,16 @@ pub(super) struct SceneImage {
     sampler: wgpu::Sampler,
     uniform: wgpu::Buffer,
     pipeline: wgpu::RenderPipeline,
+    clear: wgpu::RenderPipeline,
+    scratch: Option<wgpu::Texture>,
+    parts: Arc<[(u64, Bounds2)]>,
     image: Option<Texture>,
     source: Option<View>,
     key: u64,
     used: u64,
     rendered: f64,
+    #[cfg(test)]
+    dirty_tiles: usize,
 }
 
 struct Texture {
@@ -46,6 +53,7 @@ struct View {
     ppp: f32,
     clip: egui::Rect,
     navigation: bool,
+    style: u64,
 }
 
 impl CachedCanvasCallback {
@@ -144,22 +152,53 @@ impl SceneImage {
             multiview_mask: None,
             cache: None,
         });
+        let clear_module = device
+            .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("cad_tile_clear"), source: wgpu::ShaderSource::Wgsl(CLEAR.into()) });
+        let clear_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("cad_tile_clear"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let clear = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("cad_tile_clear"),
+            layout: Some(&clear_layout),
+            vertex: wgpu::VertexState { module: &clear_module, entry_point: Some("vs_clear"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &clear_module,
+                entry_point: Some("fs_clear"),
+                targets: &[Some(wgpu::ColorTargetState { format: target.format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                compilation_options: Default::default(),
+            }),
+            primitive: Default::default(),
+            multisample: Default::default(),
+            depth_stencil: None,
+            multiview_mask: None,
+            cache: None,
+        });
         Self {
             renderer: Box::new(Resources::new(device, GpuTarget { stencil: None, ..target })),
             layout,
             sampler,
             uniform,
             pipeline,
+            clear,
+            scratch: None,
+            parts: Arc::default(),
             image: None,
             source: None,
             key: 0,
             used: 0,
             rendered: f64::NEG_INFINITY,
+            #[cfg(test)]
+            dirty_tiles: 0,
         }
     }
 
     pub(super) fn bytes(&self) -> usize {
-        self.image.as_ref().map_or(0, |image| image.size[0] as usize * image.size[1] as usize * 4)
+        self.image
+            .as_ref()
+            .map_or(0, |image| image.size[0] as usize * image.size[1] as usize * 4)
+            .saturating_add(self.scratch.as_ref().map_or(0, |s| s.width() as usize * s.height() as usize * 4))
     }
 
     fn prepare(
@@ -171,6 +210,10 @@ impl SceneImage {
         screen: &egui_wgpu::ScreenDescriptor,
         encoder: &mut wgpu::CommandEncoder,
     ) -> bool {
+        #[cfg(test)]
+        {
+            self.dirty_tiles = 0;
+        }
         let view = &callback.canvas;
         if view.layer != LAYER_DRAWING || view.stencil != Stencil::Off || view.xform != IDENTITY_XFORM || view.scale <= 0.0 || !view.scale.is_finite()
         {
@@ -202,6 +245,7 @@ impl SceneImage {
             ppp: screen.pixels_per_point,
             clip: callback.clip,
             navigation: callback.navigation,
+            style: callback.style,
         };
         let moved = self.key != key;
         let reusable = self.image.as_ref().is_some_and(|image| image.size == size);
@@ -210,7 +254,12 @@ impl SceneImage {
             && reusable
             && callback.navigation
             && self.source.is_some_and(|old| {
-                old.mesh == source.mesh && old.screen == source.screen && old.ppp == source.ppp && old.clip == source.clip && old.navigation
+                old.mesh == source.mesh
+                    && old.style == source.style
+                    && old.screen == source.screen
+                    && old.ppp == source.ppp
+                    && old.clip == source.clip
+                    && old.navigation
             })
             && callback.time >= self.rendered
             && callback.time - self.rendered < interval;
@@ -218,6 +267,7 @@ impl SceneImage {
             callback.context.request_repaint_after(std::time::Duration::from_secs_f64((interval - (callback.time - self.rendered)).max(0.001)));
         } else if moved || !reusable {
             if !reusable {
+                self.scratch = None;
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("cad_scene_image"),
                     size: wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
@@ -225,7 +275,10 @@ impl SceneImage {
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
                     format: resources.target.format,
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                        | wgpu::TextureUsages::TEXTURE_BINDING
+                        | wgpu::TextureUsages::COPY_SRC
+                        | wgpu::TextureUsages::COPY_DST,
                     view_formats: &[],
                 });
                 let texture_view = texture.create_view(&Default::default());
@@ -240,29 +293,121 @@ impl SceneImage {
                 });
                 self.image = Some(Texture { _texture: texture, view: texture_view, bind, size });
             }
-            let Some(image) = &self.image else { return false };
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("cad_scene_image"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &image.view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT), store: wgpu::StoreOp::Store },
-                })],
-                ..Default::default()
+            let sx = size[0] as f32 / sw as f32 * screen.pixels_per_point;
+            let sy = size[1] as f32 / sh as f32 * screen.pixels_per_point;
+            let pixel_clip = egui::Rect::from_min_max(
+                egui::pos2((callback.clip.min.x * sx).floor().max(0.0), (callback.clip.min.y * sy).floor().max(0.0)),
+                egui::pos2((callback.clip.max.x * sx).ceil().min(size[0] as f32), (callback.clip.max.y * sy).ceil().min(size[1] as f32)),
+            );
+            let plan = reusable.then_some(self.source).flatten().and_then(|old| {
+                if old.screen != source.screen
+                    || old.ppp != source.ppp
+                    || old.clip != source.clip
+                    || old.style != source.style
+                    || old.scale != source.scale
+                    || old.navigation != source.navigation
+                {
+                    return None;
+                }
+                let delta = [
+                    (source.center[0] - old.center[0] + (source.offset[0] - old.offset[0]) * source.scale) * sx,
+                    (source.center[1] - old.center[1] - (source.offset[1] - old.offset[1]) * source.scale) * sy,
+                ];
+                if delta.iter().any(|v| !v.is_finite() || (v - v.round()).abs() > 0.001 || v.abs() > i32::MAX as f32) {
+                    return None;
+                }
+                let shift = delta.map(|v| v.round() as i32);
+                let damage = if old.mesh == source.mesh { Vec::new() } else { tiles::damage(&self.parts, &callback.parts)? };
+                Some((shift, damage))
             });
-            let ppp = screen.pixels_per_point;
-            let clip = callback.clip;
-            let sx = size[0] as f32 / sw as f32 * ppp;
-            let sy = size[1] as f32 / sh as f32 * ppp;
-            let x = (clip.min.x * sx).floor().max(0.0) as u32;
-            let y = (clip.min.y * sy).floor().max(0.0) as u32;
-            let right = ((clip.max.x * sx).ceil().max(0.0) as u32).min(size[0]);
-            let bottom = ((clip.max.y * sy).ceil().max(0.0) as u32).min(size[1]);
-            if right > x && bottom > y {
-                pass.set_scissor_rect(x, y, right - x, bottom - y);
-                self.renderer.paint_layer(view, layer, &mut pass, size, clip);
+            let mut partial = plan.is_some();
+            let mut shift = [0, 0];
+            let mut damage = Vec::new();
+            if let Some((delta, changed)) = plan {
+                shift = delta;
+                damage = changed
+                    .into_iter()
+                    .map(|bounds| {
+                        let points = bounds.corners().map(|p| {
+                            egui::pos2(
+                                (source.center[0] + (p.x as f32 + source.offset[0]) * source.scale) * sx,
+                                (source.center[1] - (p.y as f32 + source.offset[1]) * source.scale) * sy,
+                            )
+                        });
+                        egui::Rect::from_points(&points).expand(32.0 * sx.max(sy))
+                    })
+                    .collect();
+                if damage.iter().any(|r| !r.is_finite()) {
+                    partial = false;
+                }
             }
+            if partial && shift != [0, 0] {
+                let scratch_bytes = u64::from(tiles::EDGE.min(size[0])) * u64::from(tiles::EDGE.min(size[1])) * 4;
+                if u64::from(size[0]) * u64::from(size[1]) * 4 + scratch_bytes > resources.cache_limit as u64 {
+                    partial = false;
+                    self.scratch = None;
+                } else {
+                    let scratch = self.scratch.get_or_insert_with(|| {
+                        device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("cad_scroll_tile"),
+                            size: wgpu::Extent3d { width: tiles::EDGE.min(size[0]), height: tiles::EDGE.min(size[1]), depth_or_array_layers: 1 },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: resources.target.format,
+                            usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        })
+                    });
+                    if let Some(image) = &self.image {
+                        for region in tiles::copies(size, shift) {
+                            let extent = wgpu::Extent3d { width: region.size[0], height: region.size[1], depth_or_array_layers: 1 };
+                            encoder.copy_texture_to_texture(copy_info(&image._texture, region.from), copy_info(scratch, [0, 0]), extent);
+                            encoder.copy_texture_to_texture(copy_info(scratch, [0, 0]), copy_info(&image._texture, region.to), extent);
+                        }
+                    }
+                }
+            }
+            let valid =
+                if partial { pixel_clip.intersect(pixel_clip.translate(egui::vec2(shift[0] as f32, shift[1] as f32))) } else { egui::Rect::NOTHING };
+            let scissors = tiles::dirty(size, pixel_clip, &damage, valid);
+            #[cfg(test)]
+            {
+                self.dirty_tiles = scissors.len();
+            }
+            let Some(image) = &self.image else { return false };
+            if !scissors.is_empty() {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("cad_dirty_tiles"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &image.view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: if partial { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT) },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                if partial {
+                    for [x, y, width, height] in scissors {
+                        pass.set_scissor_rect(x, y, width, height);
+                        pass.set_viewport(0.0, 0.0, size[0] as f32, size[1] as f32, 0.0, 1.0);
+                        pass.set_pipeline(&self.clear);
+                        pass.draw(0..3, 0..1);
+                        let clip = egui::Rect::from_min_max(
+                            egui::pos2(x as f32 / sx, y as f32 / sy),
+                            egui::pos2((x + width) as f32 / sx, (y + height) as f32 / sy),
+                        );
+                        self.renderer.paint_layer(view, layer, &mut pass, size, clip);
+                    }
+                } else if pixel_clip.is_positive() {
+                    pass.set_scissor_rect(pixel_clip.min.x as u32, pixel_clip.min.y as u32, pixel_clip.width() as u32, pixel_clip.height() as u32);
+                    self.renderer.paint_layer(view, layer, &mut pass, size, callback.clip);
+                }
+            }
+            self.parts = callback.parts.clone();
             self.source = Some(source);
             self.key = key;
             self.rendered = callback.time;
@@ -355,3 +500,17 @@ struct VOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> };
 }
 @fragment fn fs_image(v: VOut) -> @location(0) vec4<f32> { return textureSample(drawing, filtering, v.uv); }
 "#;
+
+pub(super) const CLEAR: &str = r#"
+@vertex fn vs_clear(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
+    return vec4<f32>(select(-1.0, 3.0, i == 1u), select(-1.0, 3.0, i == 2u), 0.0, 1.0);
+}
+@fragment fn fs_clear() -> @location(0) vec4<f32> { return vec4<f32>(0.0); }
+"#;
+
+fn copy_info(texture: &wgpu::Texture, xy: [u32; 2]) -> wgpu::TexelCopyTextureInfo<'_> {
+    wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d { x: xy[0], y: xy[1], z: 0 }, aspect: wgpu::TextureAspect::All }
+}
+
+#[cfg(test)]
+mod tests;

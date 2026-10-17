@@ -150,7 +150,11 @@ for name in paths:
     if src.is_file():
         dest = workspace / name
         dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src, dest)
+        # Keep unchanged inputs stable, but give changed contents the copy's timestamp.
+        # Restoring an older source mtime can otherwise make Cargo reuse stale object code
+        # when a build snapshot was taken before an edit during an earlier compilation.
+        if not dest.is_file() or src.read_bytes() != dest.read_bytes():
+            shutil.copy(src, dest)
 config = workspace / ".cargo/config.toml"
 config.parent.mkdir(parents=True, exist_ok=True)
 original = (repo / ".cargo/config.toml").read_text() if (repo / ".cargo/config.toml").exists() else ""

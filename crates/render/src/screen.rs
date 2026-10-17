@@ -28,8 +28,7 @@ pub struct Part {
     /// Identity of the tessellation, independent of its position in drawing order.
     pub id: u64,
     pub list: Arc<DisplayList>,
-    /// Shared block templates and their placements. The CPU list remains available for exact
-    /// highlights/picking; a GPU consumer can omit these copied primitive ranges.
+    /// Shared geometry, interleaved with ordinary primitives without expanding its vertices.
     pub instances: Arc<[BlockInstance]>,
 }
 
@@ -37,14 +36,88 @@ pub struct Part {
 pub struct BlockInstance {
     pub template: Arc<DisplayList>,
     pub transform: Mat3,
+    pub handle: cadcraft_doc::Handle,
+    pub glyph: bool,
+    pub(crate) _glyph_source: Option<Arc<crate::text::Mesh>>,
+    /// Number of ordinary primitives preceding this placement.
+    pub at: usize,
+    /// Its indices in the expanded, logical primitive sequence (no vertex copies).
     pub prims: std::ops::Range<usize>,
     pub bounds: cadcraft_geom::Bounds2,
     pub tolerance: f64,
 }
 
 impl Part {
+    pub fn primitive_count(&self) -> usize {
+        self.list.prims.len().saturating_add(self.instances.last().map_or(0, |i| i.prims.end.saturating_sub(i.at)))
+    }
+
+    pub fn primitives(&self) -> impl Iterator<Item = Primitive<'_>> {
+        let (mut ordinary, mut instance, mut leaf) = (0, 0, 0);
+        std::iter::from_fn(move || {
+            loop {
+                if let Some(i) = self.instances.get(instance).filter(|i| i.at == ordinary) {
+                    if let Some(p) = i.template.prims.get(leaf) {
+                        leaf += 1;
+                        return Some(Primitive { source: &i.template, prim: crate::DPrim { handle: i.handle, ..*p }, transform: i.transform });
+                    }
+                    instance += 1;
+                    leaf = 0;
+                    continue;
+                }
+                let p = self.list.prims.get(ordinary)?;
+                ordinary += 1;
+                return Some(Primitive::new(&self.list, p));
+            }
+        })
+    }
+
+    fn primitive(&self, index: usize) -> Option<Primitive<'_>> {
+        let at = self.instances.partition_point(|i| i.prims.end <= index);
+        if let Some(i) = self.instances.get(at).filter(|i| i.prims.contains(&index)) {
+            let p = i.template.prims.get(index.checked_sub(i.prims.start)?)?;
+            return Some(Primitive { source: &i.template, prim: crate::DPrim { handle: i.handle, ..*p }, transform: i.transform });
+        }
+        let skipped = at.checked_sub(1).and_then(|a| self.instances.get(a)).map_or(0, |i| i.prims.end.saturating_sub(i.at));
+        self.list.prims.get(index.checked_sub(skipped)?).map(|p| Primitive::new(&self.list, p))
+    }
+
     fn bytes(&self) -> usize {
         bytes(&self.list).saturating_add(self.instances.len().saturating_mul(std::mem::size_of::<BlockInstance>()))
+    }
+}
+
+/// A primitive in its own geometry's coordinates. Only consumers that actually need world
+/// points (a selected object or the software fallback) materialize transformed coordinates.
+#[derive(Clone, Copy)]
+pub struct Primitive<'a> {
+    pub source: &'a DisplayList,
+    pub prim: crate::DPrim,
+    pub transform: Mat3,
+}
+
+impl<'a> Primitive<'a> {
+    fn new(source: &'a DisplayList, prim: &crate::DPrim) -> Self {
+        Self { source, prim: *prim, transform: Mat3::IDENTITY }
+    }
+
+    pub fn points(&self) -> std::borrow::Cow<'a, [cadcraft_geom::Vec2]> {
+        let points = self.source.points(&self.prim);
+        if self.transform == Mat3::IDENTITY {
+            std::borrow::Cow::Borrowed(points)
+        } else {
+            std::borrow::Cow::Owned(points.iter().map(|p| self.transform.apply(*p)).collect())
+        }
+    }
+
+    pub fn fill_outlines(&self) -> Vec<Vec<cadcraft_geom::Vec2>> {
+        let mut outlines = self.source.fill_outlines(&self.prim);
+        if self.transform != Mat3::IDENTITY {
+            for p in outlines.iter_mut().flatten() {
+                *p = self.transform.apply(*p);
+            }
+        }
+        outlines
     }
 }
 
@@ -63,8 +136,8 @@ pub struct Scene {
 /// with the list owning its point offsets, including for highlights and infinite lines.
 pub trait Geometry {
     fn primitive_count(&self) -> usize;
-    fn primitives(&self) -> impl Iterator<Item = (&DisplayList, &crate::DPrim)>;
-    fn primitive(&self, index: usize) -> Option<(&DisplayList, &crate::DPrim)>;
+    fn primitives(&self) -> impl Iterator<Item = Primitive<'_>>;
+    fn primitive(&self, index: usize) -> Option<Primitive<'_>>;
     fn bounds(&self) -> &cadcraft_geom::Bounds2;
 }
 
@@ -72,11 +145,11 @@ impl Geometry for DisplayList {
     fn primitive_count(&self) -> usize {
         self.prims.len()
     }
-    fn primitives(&self) -> impl Iterator<Item = (&DisplayList, &crate::DPrim)> {
-        self.prims.iter().map(move |p| (self, p))
+    fn primitives(&self) -> impl Iterator<Item = Primitive<'_>> {
+        self.prims.iter().map(move |p| Primitive::new(self, p))
     }
-    fn primitive(&self, index: usize) -> Option<(&DisplayList, &crate::DPrim)> {
-        self.prims.get(index).map(|p| (self, p))
+    fn primitive(&self, index: usize) -> Option<Primitive<'_>> {
+        self.prims.get(index).map(|p| Primitive::new(self, p))
     }
     fn bounds(&self) -> &cadcraft_geom::Bounds2 {
         &self.bounds
@@ -87,16 +160,15 @@ impl Geometry for Scene {
     fn primitive_count(&self) -> usize {
         self.count
     }
-    fn primitives(&self) -> impl Iterator<Item = (&DisplayList, &crate::DPrim)> {
-        self.parts.iter().flat_map(|part| part.list.prims.iter().map(|p| (part.list.as_ref(), p)))
+    fn primitives(&self) -> impl Iterator<Item = Primitive<'_>> {
+        self.parts.iter().flat_map(Part::primitives)
     }
-    fn primitive(&self, index: usize) -> Option<(&DisplayList, &crate::DPrim)> {
+    fn primitive(&self, index: usize) -> Option<Primitive<'_>> {
         if index >= self.count {
             return None;
         }
         let at = self.offsets.partition_point(|start| *start <= index).checked_sub(1)?;
-        let list = self.parts.get(at)?.list.as_ref();
-        list.prims.get(index.checked_sub(*self.offsets.get(at)?)?).map(|p| (list, p))
+        self.parts.get(at)?.primitive(index.checked_sub(*self.offsets.get(at)?)?)
     }
     fn bounds(&self) -> &cadcraft_geom::Bounds2 {
         &self.bounds
@@ -111,7 +183,7 @@ impl Scene {
         let mut scene = Self { parts, ..Self::default() };
         for part in &scene.parts {
             scene.offsets.push(scene.count);
-            scene.count = scene.count.saturating_add(part.list.prims.len());
+            scene.count = scene.count.saturating_add(part.primitive_count());
             scene.bounds = scene.bounds.union(&part.list.bounds);
             scene.sheet = scene.sheet.or(part.list.sheet);
         }
@@ -119,27 +191,44 @@ impl Scene {
     }
     pub fn bytes(&self) -> usize {
         let mut templates = std::collections::HashSet::new();
+        let mut glyphs = std::collections::HashSet::new();
         self.parts
             .iter()
             .map(|part| {
                 part.bytes().saturating_add(
-                    part.instances.iter().filter(|i| templates.insert(Arc::as_ptr(&i.template) as usize)).map(|i| bytes(&i.template)).sum::<usize>(),
+                    part.instances
+                        .iter()
+                        .map(|i| {
+                            let template = if templates.insert(Arc::as_ptr(&i.template) as usize) { bytes(&i.template) } else { 0 };
+                            template
+                                .saturating_add(i._glyph_source.as_ref().filter(|g| glyphs.insert(Arc::as_ptr(g) as usize)).map_or(0, |g| g.bytes()))
+                        })
+                        .sum::<usize>(),
                 )
             })
             .sum()
     }
     /// Explicit compatibility/export operation; interactive drawing never flattens the scene.
     pub fn flatten(&self) -> DisplayList {
-        if let [part] = self.parts.as_slice() {
+        if let [part] = self.parts.as_slice()
+            && part.instances.is_empty()
+        {
             return (*part.list).clone();
         }
         let mut list = DisplayList::default();
         list.prims.reserve(self.count);
         list.verts.reserve(self.parts.iter().map(|p| p.list.verts.len()).sum());
         list.tris.reserve(self.parts.iter().map(|p| p.list.tris.len()).sum());
-        for part in &self.parts {
-            append(&mut list, &part.list);
+        for primitive in self.primitives() {
+            let mut p = primitive.prim;
+            let points = primitive.points();
+            let target = if matches!(p.kind, crate::Kind::Tris | crate::Kind::Mask) { &mut list.tris } else { &mut list.verts };
+            p.start = target.len() as u32;
+            target.extend_from_slice(&points);
+            list.prims.push(p);
         }
+        list.bounds = self.bounds;
+        list.expanded = self.parts.iter().map(|p| p.list.expanded).sum();
         list.sheet = self.sheet;
         list
     }
@@ -298,14 +387,15 @@ impl Cache {
                 named: None,
                 shared_budget: Some(&budget),
                 transparency: 0,
+                sharing: true,
+                instances: Vec::new(),
             };
-            let mut instances = Vec::new();
             for e in ents {
-                if visible(drawing, e, &options) && !blocks::draw(&self.templates, &mut b, drawing, e, &mut instances) {
+                if visible(drawing, e, &options) && !blocks::draw(&self.templates, &mut b, drawing, e) {
                     entity(&mut b, &top_ctx(drawing, Mat3::IDENTITY, e.handle, &[], &[]), e);
                 }
             }
-            (key, Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(b.list), instances: instances.into() })
+            (key, Part { id: NEXT_PART.fetch_add(1, Ordering::Relaxed), list: Arc::new(b.list), instances: b.instances.into() })
         };
         #[cfg(not(target_arch = "wasm32"))]
         let made: Vec<_> = {
@@ -391,16 +481,4 @@ pub fn bytes(list: &DisplayList) -> usize {
         .saturating_mul(std::mem::size_of::<crate::DPrim>())
         .saturating_add(list.verts.capacity().saturating_mul(std::mem::size_of::<cadcraft_geom::Vec2>()))
         .saturating_add(list.tris.capacity().saturating_mul(std::mem::size_of::<cadcraft_geom::Vec2>()))
-}
-
-fn append(dst: &mut DisplayList, src: &DisplayList) {
-    let (verts, tris) = (dst.verts.len() as u32, dst.tris.len() as u32);
-    dst.prims.extend(src.prims.iter().copied().map(|mut p| {
-        p.start += if matches!(p.kind, crate::Kind::Tris | crate::Kind::Mask) { tris } else { verts };
-        p
-    }));
-    dst.verts.extend_from_slice(&src.verts);
-    dst.tris.extend_from_slice(&src.tris);
-    dst.bounds = dst.bounds.union(&src.bounds);
-    dst.expanded = dst.expanded.saturating_add(src.expanded);
 }

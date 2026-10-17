@@ -22,6 +22,7 @@ mod point;
 pub mod raster;
 pub mod screen;
 mod text;
+pub use text::{set_cache_budget as set_glyph_cache_budget, trim_cache as trim_glyph_cache};
 mod tolerance;
 pub mod units;
 mod wide;
@@ -315,6 +316,8 @@ struct Builder<'a> {
     shared_budget: Option<&'a std::sync::atomic::AtomicUsize>,
     /// Transparency (percent) of the entity being drawn.
     transparency: u8,
+    sharing: bool,
+    instances: Vec<screen::BlockInstance>,
 }
 
 /// Upper bound on the block contents drawn per display list (each block reference, MINSERT copy
@@ -324,6 +327,28 @@ struct Builder<'a> {
 pub const MAX_BLOCK_EXPANSION: usize = 2_000_000;
 
 impl Builder<'_> {
+    fn instance(&mut self, template: std::sync::Arc<DisplayList>, transform: Mat3, handle: Handle, glyph: Option<std::sync::Arc<text::Mesh>>) {
+        if template.prims.is_empty() {
+            return;
+        }
+        let bounds = Bounds2::from_points(template.bounds.corners().map(|p| transform.apply(p)));
+        let at = self.list.prims.len();
+        let first = at.saturating_add(self.instances.last().map_or(0, |i| i.prims.end.saturating_sub(i.at)));
+        let end = first.saturating_add(template.prims.len());
+        self.list.bounds = self.list.bounds.union(&bounds);
+        self.instances.push(screen::BlockInstance {
+            template,
+            transform,
+            handle,
+            glyph: glyph.is_some(),
+            _glyph_source: glyph,
+            at,
+            prims: first..end,
+            bounds,
+            tolerance: self.opts.tolerance,
+        });
+    }
+
     /// `color` and `lw` as the plot style table prints them.
     fn styled(&self, color: Ink, lw: f32) -> (Ink, f32) {
         match self.styles {
@@ -427,7 +452,12 @@ impl Builder<'_> {
                 let len = if let Some(t) = glyph {
                     let xf = crate::text::placement(t, ctx.xf);
                     let mesh = crate::text::mesh(t, xf, pixel);
-                    self.tris_at(ctx, color, &mesh.triangles, xf);
+                    if self.sharing {
+                        let (ink, _) = self.styled(color, 0.0);
+                        self.instance(mesh.template(ink.rgb, ink.aci7, self.transparency), xf, ctx.top, Some(mesh.clone()));
+                    } else {
+                        self.tris_at(ctx, color, &mesh.triangles, xf);
+                    }
                     mesh.triangles.len()
                 } else {
                     let tris = fill::triangulate_evenodd(g);
@@ -542,7 +572,17 @@ fn top_ctx<'a>(d: &'a Drawing, xf: Mat3, top: Handle, frozen: &'a [String], vp_c
 fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> DisplayList {
     let opts = &with_point_view(d, space, opts);
     let styler = style_table(d, space, opts, plotting).map(|t| plotstyle::Styler::new(d, t));
-    let mut b = Builder { list: DisplayList::default(), opts, plotting, styles: styler.as_ref(), named: None, shared_budget: None, transparency: 0 };
+    let mut b = Builder {
+        list: DisplayList::default(),
+        opts,
+        plotting,
+        styles: styler.as_ref(),
+        named: None,
+        shared_budget: None,
+        transparency: 0,
+        sharing: false,
+        instances: Vec::new(),
+    };
     if let Space::Paper(name) = space {
         b.list.sheet = paper::sheet(d, name);
     }
@@ -593,8 +633,17 @@ fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStor
     let parts: Vec<DisplayList> = ents
         .par_chunks(PARALLEL_CHUNK)
         .map(|chunk| {
-            let mut part =
-                Builder { list: DisplayList::default(), opts, plotting, styles: None, named: None, shared_budget: Some(&budget), transparency: 0 };
+            let mut part = Builder {
+                list: DisplayList::default(),
+                opts,
+                plotting,
+                styles: None,
+                named: None,
+                shared_budget: Some(&budget),
+                transparency: 0,
+                sharing: false,
+                instances: Vec::new(),
+            };
             for e in chunk {
                 entity(&mut part, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
             }
@@ -720,8 +769,17 @@ pub fn viewport_content(d: &Drawing, space: &Space, handle: Handle, area: Bounds
     }
     let opts = &with_point_view(d, space, opts);
     let styler = style_table(d, space, opts, false).map(|t| plotstyle::Styler::new(d, t));
-    let mut b =
-        Builder { list: DisplayList::default(), opts, plotting: false, styles: styler.as_ref(), named: None, shared_budget: None, transparency: 0 };
+    let mut b = Builder {
+        list: DisplayList::default(),
+        opts,
+        plotting: false,
+        styles: styler.as_ref(),
+        named: None,
+        shared_budget: None,
+        transparency: 0,
+        sharing: false,
+        instances: Vec::new(),
+    };
     contents(&mut b, d, vp, area, &Clip::Rect(area));
     b.list
 }
@@ -768,6 +826,8 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
         named: None,
         shared_budget: None,
         transparency: 0,
+        sharing: false,
+        instances: Vec::new(),
     };
     #[cfg(not(target_arch = "wasm32"))]
     let parallel = !b.plotting && b.styles.is_none() && d.model.len() >= 2 * PARALLEL_CHUNK;
@@ -792,6 +852,8 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
                         named: None,
                         shared_budget: Some(&budget),
                         transparency: 0,
+                        sharing: false,
+                        instances: Vec::new(),
                     };
                     let c = ctx();
                     for me in chunk.iter().filter(|me| seen(me)) {
@@ -938,7 +1000,17 @@ pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents:
     } else {
         opts
     };
-    let mut b = Builder { list: DisplayList::default(), opts, plotting: false, styles: None, named: None, shared_budget: None, transparency: 0 };
+    let mut b = Builder {
+        list: DisplayList::default(),
+        opts,
+        plotting: false,
+        styles: None,
+        named: None,
+        shared_budget: None,
+        transparency: 0,
+        sharing: false,
+        instances: Vec::new(),
+    };
     for e in ents {
         entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
     }
@@ -1565,6 +1637,10 @@ fn insert(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc::Insert, rg
             }
         }
     }
+    attributes(b, ctx, e, ins, rgb);
+}
+
+fn attributes(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc::Insert, rgb: Ink) {
     if b.opts.text {
         // ATTMODE (ATTDISP): 0 shows no attributes, 1 the visible ones, 2 all of them.
         let attmode = ctx.d.header.i64("ATTMODE", 1);

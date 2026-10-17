@@ -64,6 +64,7 @@ pub struct CanvasState {
     cache_limit: Option<usize>,
     scenes: VecDeque<Scene>,
     part_meshes: HashMap<u64, Arc<crate::gpu::MeshData>>,
+    image_parts: Arc<[(u64, Bounds2)]>,
     block_meshes: Arc<std::sync::Mutex<crate::gpu::blocks::Cache>>,
     selection: Selection,
     pub rebuilt_parts: usize,
@@ -201,6 +202,10 @@ impl Selection {
 }
 
 impl CanvasState {
+    pub fn set_glyph_cache_budget(&mut self, bytes: usize) {
+        cadcraft_render::set_glyph_cache_budget(bytes);
+    }
+
     /// Bound reusable CPU geometry and inactive tabs together; the active list stays complete.
     pub fn set_cache_budget(&mut self, bytes: usize) {
         self.cache_limit = Some(bytes);
@@ -326,6 +331,7 @@ impl CanvasState {
 
     /// Release retained drawing meshes while preserving the model, selection and cursor.
     pub fn trim_render_cache(&mut self) {
+        cadcraft_render::trim_glyph_cache();
         self.list = None;
         self.job = None;
         self.vp = VpContent::default();
@@ -417,7 +423,7 @@ impl PrimIndex {
             return Vec::new();
         }
         if self.list_gen != Some(list_gen) {
-            self.by_handle = list.primitives().enumerate().map(|(i, (_, p))| (p.handle, i)).collect();
+            self.by_handle = list.primitives().enumerate().map(|(i, p)| (p.prim.handle, i)).collect();
             self.by_handle.sort_unstable();
             self.list_gen = Some(list_gen);
         }
@@ -1053,9 +1059,10 @@ pub(crate) fn draw_list(p: &egui::Painter, xf: &Xf, list: &impl Geometry, bg: Rg
     let vis = xf.world_bounds();
     let mut shapes: Vec<Shape> = Vec::with_capacity(list.primitive_count());
     let px = 1.0 / xf.scale;
-    for (list, prim) in list.primitives() {
+    for primitive in list.primitives() {
+        let prim = &primitive.prim;
         let col = prim_color32(prim, bg);
-        let pts = list.points(prim);
+        let pts = primitive.points();
         match prim.kind {
             Kind::Polyline => {
                 let bb = Bounds2::from_points(pts.iter().copied());
@@ -1142,7 +1149,7 @@ fn draw_highlight_gpu(
     if *hl_key != Some(key) {
         let prims = prims();
         let mesh = crate::gpu::build_highlight_mesh(list, &prims, origin, color.to_array(), look.width, look.dashed);
-        *hl_infinite = prims.into_iter().filter(|&i| list.primitive(i).is_some_and(|(_, p)| matches!(p.kind, Kind::Infinite { .. }))).collect();
+        *hl_infinite = prims.into_iter().filter(|&i| list.primitive(i).is_some_and(|p| matches!(p.prim.kind, Kind::Infinite { .. }))).collect();
         if let Ok(mut slot) = hl_slot.lock() {
             *slot = Some(mesh);
         }
@@ -1258,6 +1265,8 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
     let key = list_mesh_key(&c.key, c.list_gen, origin, bg, lwdisplay);
     let rebuilt = c.mesh_key != Some(key);
     if rebuilt {
+        c.image_parts =
+            list.parts.iter().map(|part| (part.id, Bounds2 { min: part.list.bounds.min - origin, max: part.list.bounds.max - origin })).collect();
         let t0 = crate::now_ms();
         let mesh = {
             let mut next = HashMap::new();
@@ -1289,7 +1298,7 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
         if let Ok(mut slot) = c.mesh_slot.lock() {
             *slot = Some(mesh);
         }
-        c.infinite = list.primitives().enumerate().filter(|(_, (_, pr))| matches!(pr.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+        c.infinite = list.primitives().enumerate().filter(|(_, p)| matches!(p.prim.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
         c.mesh_key = Some(key);
         c.mesh_origin = origin;
         c.mesh_ms = crate::now_ms() - t0;
@@ -1311,6 +1320,8 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
             xf.rect,
             crate::gpu::CachedCanvasCallback {
                 canvas: callback,
+                parts: c.image_parts.clone(),
+                style: part_mesh_key(0, c.mesh_origin, bg, lwdisplay),
                 clip: p.clip_rect().intersect(xf.rect),
                 navigation: c.navigation_active,
                 reduced_resolution: c.reduced_navigation_resolution,
@@ -1324,8 +1335,9 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
     };
     p.add(callback);
     let mut shapes = Vec::new();
-    for (list, prim) in c.infinite.iter().filter_map(|i| list.primitive(*i)) {
-        let pts = list.points(prim);
+    for primitive in c.infinite.iter().filter_map(|i| list.primitive(*i)) {
+        let prim = &primitive.prim;
+        let pts = primitive.points();
         if let (Kind::Infinite { ray }, Some(b), Some(d)) = (prim.kind, pts.first(), pts.get(1))
             && let Some(seg) = clip_infinite(xf, *b, *d, ray)
         {
@@ -1372,8 +1384,9 @@ pub(crate) fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &impl Geometry, p
     let mut shapes = Vec::new();
     let mut fill = egui::Mesh::default();
     let fill_color = color.gamma_multiply(crate::gpu::HIGHLIGHT_FILL_ALPHA);
-    for (list, prim) in prims.iter().filter_map(|&i| list.primitive(i)) {
-        let pts = list.points(prim);
+    for primitive in prims.iter().filter_map(|&i| list.primitive(i)) {
+        let prim = &primitive.prim;
+        let pts = primitive.points();
         match prim.kind {
             Kind::Polyline => line(pts.iter().map(|q| xf.to_screen(*q)).collect(), &mut shapes),
             Kind::Infinite { ray } => {
@@ -1396,7 +1409,7 @@ pub(crate) fn draw_highlight(p: &egui::Painter, xf: &Xf, list: &impl Geometry, p
                 }
             }
             Kind::Tris | Kind::Mask => {
-                for outline in list.fill_outlines(prim) {
+                for outline in primitive.fill_outlines() {
                     line(outline.iter().map(|q| xf.to_screen(*q)).collect(), &mut shapes);
                 }
             }
