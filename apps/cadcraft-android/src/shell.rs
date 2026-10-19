@@ -588,18 +588,18 @@ impl Shell {
         self.requested_cache_mib = requested;
         #[cfg(target_os = "android")]
         let mib = crate::platform::memory_state()
-            .map(|state| crate::memory::cache_mib(requested, crate::memory::resident_bytes(), state))
-            .unwrap_or(requested);
+            .map(|state| crate::memory::cache_mib(requested, (!force).then_some(self.cache_mib), crate::memory::resident_bytes(), state))
+            .unwrap_or_else(|_| if force { requested.min(128) } else { self.cache_mib.min(requested) });
         #[cfg(not(target_os = "android"))]
         let mib = requested;
         self.memory_at = Instant::now();
         self.cad.session.set_undo_memory_budget(((mib.saturating_mul(2).clamp(8, 64)) as usize) << 20);
         if force || self.cache_mib != mib {
             self.cache_mib = mib;
-            let gpu = mib * 2 / 3;
-            let glyph = mib / 8;
-            let spatial = mib / 12;
-            let snap = (mib / 16).min(2);
+            let gpu = mib / 2;
+            let glyph = (mib / 16).min(64);
+            let spatial = (mib / 16).min(128);
+            let snap = (mib / 32).min(32);
             self.cad.session.set_snap_cache_budget((snap as usize) << 20);
             cadcraft_engine::spatial::set_cache_budget((spatial as usize) << 20);
             self.cad.canvas.set_glyph_cache_budget((glyph as usize) << 20);

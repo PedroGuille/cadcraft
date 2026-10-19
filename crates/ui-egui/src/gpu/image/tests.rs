@@ -500,3 +500,74 @@ fn a_single_outline_character_keeps_the_smaller_packed_upload() {
     assert!(!vector_page(&mesh), "an isolated outline should not allocate a vector texture page");
     assert_eq!(cache.lock().unwrap().bytes(), 0);
 }
+
+#[test]
+fn revisiting_pan_zoom_and_resolution_views_reuses_exact_tiles() {
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    install(&rs, &Arc::new(GpuFaults::default()), None);
+    set_cache_budget(&rs, 128);
+    let first = callback(501, Some(200.0), [0.0, 0.0]);
+    let pixels = render(&rs, &first);
+    let away = callback(502, Some(200.0), [1200.0, 0.0]);
+    same_pixels(&render(&rs, &away), &render(&rs, &away.canvas), "distant pan");
+    let back = callback(503, Some(200.0), [0.0, 0.0]);
+    same_pixels(&render(&rs, &back), &pixels, "return to retained pan tiles");
+    assert_eq!(dirty_count(&rs), 0);
+    let mut zoom = callback(504, Some(200.0), [0.0, 0.0]);
+    zoom.canvas.scale = 2.0;
+    same_pixels(&render(&rs, &zoom), &render(&rs, &zoom.canvas), "zoomed geometry");
+    let mut reduced = callback(505, Some(200.0), [0.0, 0.0]);
+    reduced.navigation = true;
+    reduced.reduced_resolution = true;
+    render(&rs, &reduced);
+    let back = callback(506, Some(200.0), [0.0, 0.0]);
+    same_pixels(&render(&rs, &back), &pixels, "native-resolution tiles restored");
+    assert_eq!(dirty_count(&rs), 0);
+    let renderer = rs.renderer.read();
+    let image = renderer.callback_resources.get::<Resources>().unwrap().image.as_ref().unwrap();
+    assert!(image.history.len() >= 2);
+    assert!(image.bytes() <= 64 << 20);
+    drop(renderer);
+    set_cache_budget(&rs, 6);
+    assert!(rs.renderer.read().callback_resources.get::<Resources>().unwrap().image.as_ref().unwrap().history.is_empty());
+    same_pixels(&render(&rs, &back), &pixels, "pressure trims history without changing the drawing");
+}
+
+#[test]
+fn view_reuse_requires_complete_content_identities_and_display_style() {
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    install(&rs, &Arc::new(GpuFaults::default()), None);
+    set_cache_budget(&rs, 64);
+    let mut original = callback(601, Some(200.0), [0.0, 0.0]);
+    original.parts = Arc::default();
+    render(&rs, &original);
+    let mut edit = callback(602, Some(800.0), [0.0, 0.0]);
+    edit.parts = Arc::default();
+    same_pixels(&render(&rs, &edit), &render(&rs, &edit.canvas), "missing damage metadata must not hide edits");
+    assert_eq!(dirty_count(&rs), 6);
+    edit.style += 1;
+    render(&rs, &edit);
+    assert_eq!(dirty_count(&rs), 6, "style changes invalidate the image even with the same mesh key");
+}
+
+#[test]
+fn gradual_panning_keeps_past_tiles_within_the_shared_image_allowance() {
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    install(&rs, &Arc::new(GpuFaults::default()), None);
+    set_cache_budget(&rs, 128);
+    render(&rs, &callback(701, Some(200.0), [0.0, 0.0]));
+    for step in 1..=16 {
+        let view = callback(701 + step, Some(200.0), [step as f32 * 80.0, 0.0]);
+        let cached = render(&rs, &view);
+        if step == 16 {
+            same_pixels(&cached, &render(&rs, &view.canvas), "incremental pan after retaining an old view");
+        }
+    }
+    let renderer = rs.renderer.read();
+    let image = renderer.callback_resources.get::<Resources>().unwrap().image.as_ref().unwrap();
+    assert!(!image.history.is_empty(), "small pans must also retain previously visited tiles");
+    assert!(image.bytes() <= 64 << 20);
+    drop(renderer);
+    let back = callback(730, Some(200.0), [0.0, 0.0]);
+    same_pixels(&render(&rs, &back), &render(&rs, &back.canvas), "return through retained scrolling history");
+}

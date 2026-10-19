@@ -25,7 +25,7 @@ impl Default for Cache {
 
 impl Cache {
     pub fn set_budget(&mut self, bytes: usize) {
-        let bytes = bytes.min(8 << 20);
+        let bytes = bytes.min(256 << 20);
         self.glyphs.set_budget(bytes / 3);
         self.limit = bytes - bytes / 3;
         while self.bytes > self.limit {

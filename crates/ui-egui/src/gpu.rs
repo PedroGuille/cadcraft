@@ -1040,7 +1040,10 @@ impl Resources {
 /// One allowance shared by every retained GPU layer, apart from buffers needed for this frame.
 pub fn set_cache_budget(rs: &egui_wgpu::RenderState, mib: u32) {
     if let Some(resources) = rs.renderer.write().callback_resources.get_mut::<Resources>() {
-        resources.cache_limit = (mib.min(64) as usize) << 20;
+        resources.cache_limit = (mib.min(2048) as usize) << 20;
+        if let Some(image) = resources.image.as_mut() {
+            image.trim_history(resources.cache_limit / 2, 0);
+        }
         if resources.image.as_ref().is_some_and(|image| image.bytes() > resources.cache_limit) {
             resources.image = None;
         }

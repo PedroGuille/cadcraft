@@ -3,7 +3,7 @@
 
 #[cfg(any(target_os = "android", feature = "desktop-preview"))]
 mod jobs;
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", test))]
 mod memory;
 #[cfg(target_os = "android")]
 mod platform;

@@ -20,6 +20,8 @@ pub struct Preferences {
     pub barrel_cancel: bool,
     pub compact: bool,
     pub cache_mib: u32,
+    #[serde(default)]
+    pub cache_version: u8,
     pub recovery_seconds: u64,
     pub reduced_navigation_resolution: bool,
     pub navigation_fps: u32,
@@ -34,7 +36,8 @@ impl Default for Preferences {
             double_tap_ms: 300,
             barrel_cancel: true,
             compact: false,
-            cache_mib: 24,
+            cache_mib: 2048,
+            cache_version: 1,
             recovery_seconds: 5,
             reduced_navigation_resolution: true,
             navigation_fps: 30,
@@ -45,7 +48,11 @@ impl Default for Preferences {
 impl Preferences {
     pub fn validate(&mut self) {
         self.double_tap_ms = self.double_tap_ms.clamp(50, 500);
-        self.cache_mib = self.cache_mib.clamp(8, 64);
+        if self.cache_version == 0 {
+            self.cache_mib = 2048;
+            self.cache_version = 1;
+        }
+        self.cache_mib = self.cache_mib.clamp(8, 2048);
         self.recovery_seconds = self.recovery_seconds.clamp(2, 60);
         self.navigation_fps = self.navigation_fps.clamp(15, 60);
     }
@@ -229,7 +236,7 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                 ui.checkbox(&mut app.tablet_prefs.barrel_cancel, crate::i18n::t("Pen button to cancel"));
                 ui.checkbox(&mut app.tablet_prefs.compact, crate::i18n::t("Compact controls"));
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.double_tap_ms, 50..=500).text(crate::i18n::t("Double tap delay (ms)")));
-                ui.add(egui::Slider::new(&mut app.tablet_prefs.cache_mib, 8..=64).text(crate::i18n::t("Render cache (MB)")));
+                ui.add(egui::Slider::new(&mut app.tablet_prefs.cache_mib, 8..=2048).logarithmic(true).text(crate::i18n::t("Render cache (MB)")));
                 ui.add(egui::Slider::new(&mut app.tablet_prefs.recovery_seconds, 2..=60).text(crate::i18n::t("Recovery interval (s)")));
                 ui.separator();
                 ui.checkbox(&mut app.tablet_prefs.reduced_navigation_resolution, crate::i18n::t("Lower resolution while panning and zooming"));
@@ -378,4 +385,23 @@ pub fn chrome(app: &mut CadApp, ui: &mut egui::Ui) {
                 });
             });
     });
+}
+
+#[cfg(test)]
+mod cache_preferences_tests {
+    use super::Preferences;
+
+    #[test]
+    fn upgrades_old_cache_preferences_once_and_preserves_new_custom_limits() {
+        let mut old: Preferences = serde_json::from_str(r#"{"cache_mib":24}"#).unwrap();
+        old.validate();
+        assert_eq!((old.cache_mib, old.cache_version), (2048, 1));
+        old.cache_mib = 512;
+        let mut restored: Preferences = serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        restored.validate();
+        assert_eq!(restored.cache_mib, 512);
+        restored.cache_mib = u32::MAX;
+        restored.validate();
+        assert_eq!(restored.cache_mib, 2048);
+    }
 }

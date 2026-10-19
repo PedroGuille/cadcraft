@@ -2,6 +2,7 @@
 //! Navigation refreshes geometry at 30 Hz and at reduced resolution. Between those refreshes
 //! the previous image is reprojected to the current view, without delaying input or the pen.
 
+use std::collections::VecDeque;
 use std::hash::{Hash, Hasher};
 
 use super::*;
@@ -29,9 +30,11 @@ pub(super) struct SceneImage {
     parts: Arc<[cadcraft_render::screen::DamagePart]>,
     image: Option<Texture>,
     source: Option<View>,
+    anchor: Option<View>,
     key: u64,
     used: u64,
     rendered: f64,
+    history: VecDeque<Frame>,
     #[cfg(test)]
     dirty_tiles: usize,
 }
@@ -41,6 +44,26 @@ struct Texture {
     view: wgpu::TextureView,
     bind: wgpu::BindGroup,
     size: [u32; 2],
+}
+
+struct Frame {
+    image: Texture,
+    source: View,
+    parts: Arc<[cadcraft_render::screen::DamagePart]>,
+    rendered: f64,
+}
+
+impl Frame {
+    fn bytes(&self) -> usize {
+        (self.image.size[0] as usize)
+            .saturating_mul(self.image.size[1] as usize)
+            .saturating_mul(4)
+            .saturating_add(self.parts.len().saturating_mul(std::mem::size_of::<cadcraft_render::screen::DamagePart>()))
+    }
+}
+
+fn same_parts(a: &[cadcraft_render::screen::DamagePart], b: &[cadcraft_render::screen::DamagePart]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.id == b.id && a.origin == b.origin)
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +83,7 @@ impl CachedCanvasCallback {
     fn key(&self, screen: &egui_wgpu::ScreenDescriptor) -> u64 {
         let mut key = std::collections::hash_map::DefaultHasher::new();
         self.canvas.key.hash(&mut key);
+        self.style.hash(&mut key);
         self.navigation.hash(&mut key);
         self.reduced_resolution.hash(&mut key);
         self.navigation_fps.hash(&mut key);
@@ -186,9 +210,11 @@ impl SceneImage {
             parts: Arc::default(),
             image: None,
             source: None,
+            anchor: None,
             key: 0,
             used: 0,
             rendered: f64::NEG_INFINITY,
+            history: VecDeque::new(),
             #[cfg(test)]
             dirty_tiles: 0,
         }
@@ -199,6 +225,103 @@ impl SceneImage {
             .as_ref()
             .map_or(0, |image| image.size[0] as usize * image.size[1] as usize * 4)
             .saturating_add(self.scratch.as_ref().map_or(0, |s| s.width() as usize * s.height() as usize * 4))
+            .saturating_add(self.history.iter().fold(0usize, |n, f| n.saturating_add(f.bytes())))
+    }
+
+    /// Images retain their existing dirty tiles; changing modes never copies a whole texture.
+    fn remember(&mut self) {
+        if let (Some(image), Some(source)) = (self.image.take(), self.source.take()) {
+            // Keep identity/bounds, without retaining old drawing entities through damage data.
+            let parts = self.parts.iter().map(|p| cadcraft_render::screen::DamagePart { details: None, ..p.clone() }).collect();
+            self.history.push_back(Frame { image, source, parts, rendered: self.rendered });
+        }
+        self.parts = Arc::default();
+        self.anchor = None;
+        self.key = 0;
+    }
+
+    pub(super) fn trim_history(&mut self, limit: usize, reserve: usize) {
+        while self.history.len() > 32 || (!self.history.is_empty() && self.bytes().saturating_add(reserve) > limit) {
+            self.history.pop_front();
+        }
+        if self.bytes().saturating_add(reserve) > limit {
+            self.scratch = None;
+        }
+    }
+
+    fn reuse_view(&mut self, source: View, parts: &Arc<[cadcraft_render::screen::DamagePart]>, size: [u32; 2], key: u64, limit: usize) {
+        if self.key == key && self.image.as_ref().is_some_and(|image| image.size == size) {
+            self.trim_history(limit, 0);
+            return;
+        }
+        let overlap = |old: View, old_size: [u32; 2], old_parts: &[cadcraft_render::screen::DamagePart]| {
+            if old_size != size
+                || old.screen != source.screen
+                || old.ppp != source.ppp
+                || old.clip != source.clip
+                || old.style != source.style
+                || old.scale != source.scale
+                || (old.mesh != source.mesh && (parts.is_empty() || !same_parts(old_parts, parts)))
+            {
+                return 0.0;
+            }
+            let dx = (source.center[0] - old.center[0] + (source.offset[0] - old.offset[0]) * source.scale).abs();
+            let dy = (source.center[1] - old.center[1] - (source.offset[1] - old.offset[1]) * source.scale).abs();
+            let area = source.clip.area();
+            if area > 0.0 && dx.is_finite() && dy.is_finite() {
+                (source.clip.width() - dx).max(0.0) * (source.clip.height() - dy).max(0.0) / area
+            } else {
+                0.0
+            }
+        };
+        let current = self.source.zip(self.image.as_ref()).map_or(0.0, |(old, image)| overlap(old, image.size, &self.parts));
+        let mut best = current;
+        let mut found = None;
+        for (i, frame) in self.history.iter().enumerate() {
+            let score = overlap(frame.source, frame.image.size, &frame.parts);
+            if score > best + 0.01 {
+                best = score;
+                found = Some(i);
+            }
+        }
+        if let Some(at) = found {
+            if let Some(frame) = self.history.remove(at) {
+                self.remember();
+                self.image = Some(frame.image);
+                self.source = Some(frame.source);
+                self.anchor = Some(frame.source);
+                self.parts = frame.parts;
+                self.rendered = frame.rendered;
+            }
+        } else if self.source.is_some_and(|old| {
+            let moved = old.offset != source.offset || old.center != source.center || old.scale != source.scale || old.screen != source.screen;
+            let travelled = self.anchor.is_some_and(|anchor| {
+                let dx = (source.center[0] - anchor.center[0] + (source.offset[0] - anchor.offset[0]) * source.scale).abs();
+                let dy = (source.center[1] - anchor.center[1] - (source.offset[1] - anchor.offset[1]) * source.scale).abs();
+                dx >= source.clip.width() * 0.75 || dy >= source.clip.height() * 0.75
+            });
+            self.image.as_ref().is_some_and(|image| image.size != size) || old.scale != source.scale || (moved && (current < 0.25 || travelled))
+        }) {
+            self.remember();
+        }
+        // Exact pixels can survive a new mesh wrapper/generation when all part identities match.
+        if self.source.is_some_and(|old| {
+            old.offset == source.offset
+                && old.center == source.center
+                && old.scale == source.scale
+                && old.screen == source.screen
+                && old.ppp == source.ppp
+                && old.clip == source.clip
+                && old.style == source.style
+        }) && self.image.as_ref().is_some_and(|image| image.size == size)
+            && (self.source.is_some_and(|old| old.mesh == source.mesh) || (!parts.is_empty() && same_parts(&self.parts, parts)))
+        {
+            self.key = key;
+            self.source = Some(source);
+            self.parts = parts.clone();
+        }
+        let required = if self.image.is_none() { (size[0] as usize).saturating_mul(size[1] as usize).saturating_mul(4) } else { 0 };
+        self.trim_history(limit, required);
     }
 
     fn prepare(
@@ -247,6 +370,9 @@ impl SceneImage {
             navigation: callback.navigation,
             style: callback.style,
         };
+        let frame_bytes = (size[0] as usize).saturating_mul(size[1] as usize).saturating_mul(4);
+        let image_budget = (resources.cache_limit / 2).max(frame_bytes).min(resources.cache_limit);
+        self.reuse_view(source, &callback.parts, size, key, image_budget);
         let moved = self.key != key;
         let reusable = self.image.as_ref().is_some_and(|image| image.size == size);
         let interval = 1.0 / f64::from(callback.navigation_fps.clamp(15, 60));
@@ -267,6 +393,7 @@ impl SceneImage {
             callback.context.request_repaint_after(std::time::Duration::from_secs_f64((interval - (callback.time - self.rendered)).max(0.001)));
         } else if moved || !reusable {
             if !reusable {
+                self.anchor = Some(source);
                 self.scratch = None;
                 let texture = device.create_texture(&wgpu::TextureDescriptor {
                     label: Some("cad_scene_image"),
@@ -343,7 +470,8 @@ impl SceneImage {
             }
             if partial && shift != [0, 0] {
                 let scratch_bytes = u64::from(tiles::EDGE.min(size[0])) * u64::from(tiles::EDGE.min(size[1])) * 4;
-                if u64::from(size[0]) * u64::from(size[1]) * 4 + scratch_bytes > resources.cache_limit as u64 {
+                self.trim_history(image_budget, if self.scratch.is_none() { scratch_bytes as usize } else { 0 });
+                if self.bytes().saturating_add(if self.scratch.is_none() { scratch_bytes as usize } else { 0 }) > resources.cache_limit {
                     partial = false;
                     self.scratch = None;
                 } else {

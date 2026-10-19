@@ -12,9 +12,10 @@ is reprojected between drawing refreshes, so the refresh limit never sleeps or d
 After 180 ms without view movement, navigation ends and the native-resolution image returns.
 Idle rendering stays driven by events and existing host timers.
 
-The main drawing can be retained as one transparent GPU image below cursor, snap, selection
-and command overlays. Changes to content, view, background, clipping, size or DPI invalidate
-it. The texture shares the retained GPU allowance with inactive mesh buffers. If a sharp
+The main drawing can be retained as transparent tiled GPU images below cursor, snap, selection
+and command overlays. Content identities, background, clipping, size and DPI determine whether
+pixels can be reused; incompatible views refresh. The images share the retained GPU allowance
+with inactive mesh buffers. If a sharp
 stationary image cannot fit, the canvas draws directly at native resolution. Active clipped
 viewport contents retain their existing stencil rendering path.
 
@@ -71,9 +72,9 @@ path; the original detailed image returns at rest. Texture and scratch storage s
 allowance. If they cannot fit, scrolling is skipped or direct native-resolution drawing is used.
 
 The tablet host now includes both reusable glyph outlines and tessellated meshes in its shared
-cache allowance. At the default 24 MiB, the split is GPU/image 16 MiB, glyph geometry 3 MiB,
-spatial indexes 2 MiB, snapping 1 MiB, and remaining CPU caches 2 MiB. This preserves the
-previous GPU allowance so sharp canvas images still fit on higher-resolution tablets. Glyph geometry gives one
+cache allowance. Android 0.1.1 used a default 24 MiB split: GPU/image 16 MiB, glyph geometry 3 MiB,
+spatial indexes 2 MiB, snapping 1 MiB, and remaining CPU caches 2 MiB. Android 0.1.3 replaces
+that small default with the adaptive allowance below. Glyph geometry gives one
 third to outlines and two thirds to tessellation. Memory-pressure trimming discards cold entries;
 strong references from active geometry remain valid. These allowances describe reusable payload,
 not a hard process-memory cap or allocator telemetry. Desktop defaults remain unchanged.
@@ -110,3 +111,55 @@ The shader uses a vertex-readable float texture supported by GLES 3 and WebGL2, 
 buffers, raster glyphs or loss of vector detail. Pages share the existing block-cache allowance;
 weak lookups preserve active sharing when optional retention is zero. Worker uploads use the
 render queue, so a newly visible page can be prepared off the UI thread.
+
+## Retained views and adaptive 2 GiB allowance (Android 0.1.3)
+
+The requested reconstructible-cache ceiling is now **2,048 MiB**, allocated only when useful
+content is encountered. Existing tablet preferences migrate once; subsequent user changes are
+preserved. The slider supports 8–2,048 MiB. This is not a 2 GiB reservation or a process-memory
+cap: live drawings, active GPU geometry, drivers and undo have their own costs.
+
+At full allowance, the split is GPU/images 1,024 MiB, glyph geometry 64 MiB, spatial indexes
+128 MiB, snapping 32 MiB and CPU geometry/meshes/panel/grid models 800 MiB. Up to 8 MiB for grid
+meshes and 4 MiB for palette models are reserved from that CPU share. GPU block geometry and
+vector text pages can retain more templates; CPU block templates can retain up to 128 MiB
+within their existing parent allowance. Shared instances still reference the same geometry.
+
+Android checks available memory and process RSS every five seconds. Initial growth leaves a
+quarter of physical RAM for system headroom and aims to keep the process below half of RAM
+(up to 4 GiB). These are soft headroom checks, not an Android allocation guarantee. Low-memory
+signals drop optional retention to zero; pressure reduces the allowance, and recovery increases
+it in 128 MiB increments. Hysteresis avoids repeatedly evicting a useful cache merely because
+its own allocations reduced free memory. Missing telemetry cannot trigger unchecked growth.
+Exact live data is never trimmed. Undo stays at 20 steps with its separate session allowance.
+
+Up to 32 compatible past tiled images can survive distant pans, zoom changes and native/reduced
+resolution transitions, bounded together by the image share (normally half the GPU allowance).
+Textures are moved into history, without an extra full-image copy. Cumulative pans checkpoint
+visited areas after three quarters of a canvas, so gradual navigation also retains history. Returning to an identical
+view and immutable content reuses its pixels; overlapping views can scroll retained tiles.
+Styles, DPI, clipping, transforms and complete ordered content identities gate reuse. Missing
+metadata or changed contents refresh conservatively. Old image metadata drops entity references.
+
+Ordinary geometry chunks touching a visited area can build without clipping to that view, then
+rely on the existing pre-submit GPU culling. Entirely distant chunks keep conservative culling;
+pressure disables the additional prefetch. Panning can reuse complete visited chunks. Clipped hatch/block chunks and up to 32
+view/zoom variants can survive revisits under the CPU allowance; incompatible settings and
+changed chunks rebuild at full detail. Old view variants are discarded after model edits to
+avoid creating an extra drawing-snapshot history. Active geometry remains valid after trimming.
+
+Snapping now compiles bounded block and dimension geometry, including nested transforms and
+stored dimension blocks. Each exact probe still reapplies the original per-leaf pruning and
+candidate order, and each query retains the shared expansion budget. Intersections, nearest,
+perpendicular, tangent, deferred snaps and tracking remain cursor/base dependent. Drawing or
+symbol/style changes invalidate compiled data; oversized entries use the original search.
+
+The grid caches its anti-aliased mesh for up to eight views. Grid spacing, snap frame, isometric
+mode, theme, DPI and viewport transforms invalidate it. Palette caches reuse unchanged layer
+and style lists, selection type groups, common property values and polyline length/area.
+Weak entity identities catch preview edits and undo without retaining old drawing snapshots.
+Widgets and input handling remain live, and both caches release retained data under pressure.
+
+Regression checks compare cached/uncached snapping and full-detail geometry, reuse after view
+changes, invalidation after edits/undo, memory-pressure fallback and direct/retained GPU pixels.
+Android device FPS, power and thermal behavior still need measurements on real tablets.

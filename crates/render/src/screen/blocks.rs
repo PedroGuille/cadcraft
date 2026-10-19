@@ -15,7 +15,7 @@ pub(super) struct Templates {
 
 impl Templates {
     pub fn set_budget(&mut self, bytes: usize) {
-        self.limit = bytes.min(8 << 20);
+        self.limit = bytes.min(128 << 20);
         while self.bytes > self.limit {
             let Some((_, _, _, list)) = self.entries.pop() else { break };
             self.bytes = self.bytes.saturating_sub(super::bytes(&list));

@@ -390,35 +390,42 @@ fn gather_in(
         if count > 2000 {
             break;
         }
-        if osmode & mode::INS != 0 {
-            match &e.kind {
-                EntityKind::Text(t) => cands.push((mode::INS, t.justify_point())),
-                EntityKind::MText(t) => cands.push((mode::INS, t.insert.xy())),
-                EntityKind::Tolerance(t) => cands.push((mode::INS, t.insert.xy())),
-                EntityKind::Insert(i) => {
-                    cands.push((mode::INS, i.insert.xy()));
-                    cands.extend(i.attribs.iter().filter(|a| !a.invisible).map(|a| (mode::INS, a.text.justify_point())));
-                }
-                EntityKind::AttDef(a) => cands.push((mode::INS, a.text.justify_point())),
-                // A multileader: its text's insertion point, or its block content's.
-                EntityKind::MLeader(m) => {
-                    cands.extend(m.text.iter().map(|t| (mode::INS, t.insert.xy())));
-                    cands.extend(m.block.iter().map(|b| (mode::INS, b.insert.xy())));
-                }
-                _ => {}
-            }
-        }
-        let mut sink = Sink { osmode, aperture, probe, cands: &mut cands, near: &mut near_prims };
-        sink.object(&e.kind, None);
-        // A block reference snaps to the objects inside it, placed by its transform.
-        if let EntityKind::Insert(ins) = &e.kind {
-            block_leaves(d, ins, &Mat3::IDENTITY, 0, &mut budget, frozen, &mut |k, m| sink.object(k, Some(m)));
-        }
-        if let EntityKind::Dimension(dm) = &e.kind {
-            sink.dimension(d, dm, &mut budget, frozen);
-        }
+        let mut sink = Sink { osmode, aperture, probe, cands: &mut cands, near: &mut near_prims, recording: None };
+        gather_entity(d, e, &mut sink, &mut budget, frozen);
     }
     Some((cands, near_prims))
+}
+
+/// One top-level entity, keeping the shared nested-block traversal budget and draw order.
+fn gather_entity(d: &Drawing, e: &cadcraft_doc::Entity, sink: &mut Sink<'_>, budget: &mut usize, frozen: &[String]) {
+    let start = sink.cands.len();
+    if sink.osmode & mode::INS != 0 {
+        match &e.kind {
+            EntityKind::Text(t) => sink.cands.push((mode::INS, t.justify_point())),
+            EntityKind::MText(t) => sink.cands.push((mode::INS, t.insert.xy())),
+            EntityKind::Tolerance(t) => sink.cands.push((mode::INS, t.insert.xy())),
+            EntityKind::Insert(i) => {
+                sink.cands.push((mode::INS, i.insert.xy()));
+                sink.cands.extend(i.attribs.iter().filter(|a| !a.invisible).map(|a| (mode::INS, a.text.justify_point())));
+            }
+            EntityKind::AttDef(a) => sink.cands.push((mode::INS, a.text.justify_point())),
+            // A multileader: its text's insertion point, or its block content's.
+            EntityKind::MLeader(m) => {
+                sink.cands.extend(m.text.iter().map(|t| (mode::INS, t.insert.xy())));
+                sink.cands.extend(m.block.iter().map(|b| (mode::INS, b.insert.xy())));
+            }
+            _ => {}
+        }
+    }
+    sink.record(start, None, false);
+    sink.object(&e.kind, None);
+    // A block reference snaps to the objects inside it, placed by its transform.
+    if let EntityKind::Insert(ins) = &e.kind {
+        block_leaves(d, ins, &Mat3::IDENTITY, 0, budget, frozen, &mut |k, m| sink.object(k, Some(m)));
+    }
+    if let EntityKind::Dimension(dm) = &e.kind {
+        sink.dimension(d, dm, budget, frozen);
+    }
 }
 
 /// Picks the best of the gathered candidates, adding the base-dependent and deferred snaps.
@@ -513,12 +520,27 @@ struct Sink<'a> {
     probe: Bounds2,
     cands: &'a mut Vec<(u32, Vec2)>,
     near: &'a mut Vec<Prim>,
+    recording: Option<&'a mut cache::Recording>,
 }
 
 impl Sink<'_> {
+    fn full(&self) -> bool {
+        self.recording.as_ref().is_some_and(|r| r.full)
+    }
+
+    fn record(&mut self, start: usize, primitive: Option<usize>, prune: bool) {
+        if let Some(recording) = self.recording.as_mut() {
+            recording.record(start..self.cands.len(), primitive, prune, self.cands, self.near);
+        }
+    }
+
     /// The snap points of one object; `xf` places an object from inside a block reference
     /// (whose primitives far from the cursor are skipped).
     fn object(&mut self, kind: &EntityKind, xf: Option<&Mat3>) {
+        if self.full() {
+            return;
+        }
+        let start = self.cands.len();
         let osmode = self.osmode;
         // OSNAPHATCH = 0: hatches are left out.
         if osmode & mode::HATCH == 0 && matches!(kind, EntityKind::Hatch(_)) {
@@ -530,11 +552,16 @@ impl Sink<'_> {
         {
             self.cands.extend(s.corners.iter().map(|c| (mode::END, at(c.xy()))));
         }
+        self.record(start, None, false);
         for p in kind.prims() {
+            if self.full() {
+                return;
+            }
+            let start = self.cands.len();
             let p = match xf {
                 Some(m) => {
                     let p = xform_prim(&p, m);
-                    if !prim_near(&p, &self.probe, self.aperture) {
+                    if self.recording.is_none() && !prim_near(&p, &self.probe, self.aperture) {
                         continue;
                     }
                     p
@@ -623,7 +650,9 @@ impl Sink<'_> {
                 Prim::Fill(_) => {}
             }
             self.near.push(p);
+            self.record(start, Some(self.near.len() - 1), xf.is_some());
         }
+        let start = self.cands.len();
         if osmode & mode::GCEN != 0 {
             // The centroid of the area a closed polyline or spline encloses.
             let pts = match kind {
@@ -637,6 +666,7 @@ impl Sink<'_> {
                 self.cands.push((mode::GCEN, at(c)));
             }
         }
+        self.record(start, None, false);
     }
 }
 
@@ -664,6 +694,10 @@ impl Sink<'_> {
             None => {
                 let g = cadcraft_render::dimension_in(d, dm);
                 for line in &g.lines {
+                    if self.full() {
+                        return;
+                    }
+                    let start = self.cands.len();
                     let (Some(a), Some(b)) = (line.first(), line.last()) else { continue };
                     if self.osmode & mode::END != 0 {
                         self.cands.extend([(mode::END, *a), (mode::END, *b)]);
@@ -671,20 +705,28 @@ impl Sink<'_> {
                     if self.osmode & mode::MID != 0 && line.len() == 2 {
                         self.cands.push((mode::MID, (*a + *b) * 0.5));
                     }
+                    self.record(start, None, false);
                     for w in line.windows(2) {
                         if let [p, q] = w {
                             let s = Prim::Seg(Segment::Line(cadcraft_geom::Line::new(*p, *q)));
-                            if prim_near(&s, &self.probe, self.aperture) {
+                            if self.recording.is_some() || prim_near(&s, &self.probe, self.aperture) {
+                                let start = self.cands.len();
                                 self.near.push(s);
+                                self.record(start, Some(self.near.len() - 1), true);
+                                if self.full() {
+                                    return;
+                                }
                             }
                         }
                     }
                 }
             }
         }
+        let start = self.cands.len();
         if self.osmode & mode::NOD != 0 {
             self.cands.extend(dim_def_points(dm).into_iter().map(|p| (mode::NOD, p)));
         }
+        self.record(start, None, false);
     }
 }
 

@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="io.github.storytold.cadcraft"
-    android:versionCode="7015" android:versionName="0.1.2">
+    android:versionCode="7016" android:versionName="0.1.3">
     <uses-sdk android:minSdkVersion="26" android:targetSdkVersion="36" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
     <supports-screens android:smallScreens="false" android:normalScreens="true"

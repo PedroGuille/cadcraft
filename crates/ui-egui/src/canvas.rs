@@ -66,6 +66,8 @@ pub struct CanvasState {
     image_parts: Arc<[cadcraft_render::screen::DamagePart]>,
     block_meshes: Arc<std::sync::Mutex<crate::gpu::blocks::Cache>>,
     selection: Selection,
+    grid: std::sync::Mutex<grid::Cache>,
+    pub(crate) panels: crate::palettes::cache::Cache,
     pub rebuilt_parts: usize,
     pub reused_parts: usize,
     /// CPU mesh bytes rebuilt for the last drawing upload. Previously uploaded parts can also
@@ -208,9 +210,16 @@ impl CanvasState {
 
     /// Bound reusable CPU geometry and inactive tabs together; the active list stays complete.
     pub fn set_cache_budget(&mut self, bytes: usize) {
-        self.cache_limit = Some(bytes);
+        let grid_bytes = (bytes / 32).min(8 << 20);
+        let panel_bytes = (bytes / 32).min(4 << 20);
+        let geometry = bytes.saturating_sub(grid_bytes).saturating_sub(panel_bytes);
+        self.cache_limit = Some(geometry);
+        if let Ok(grid) = self.grid.get_mut() {
+            grid.set_budget(grid_bytes);
+        }
+        self.panels.set_budget(panel_bytes);
         if let Ok(mut cache) = self.block_meshes.try_lock() {
-            cache.set_budget(bytes / 4);
+            cache.set_budget(geometry / 4);
         }
         self.enforce_cache_budget();
     }
@@ -340,6 +349,10 @@ impl CanvasState {
         self.source = None;
         self.render_cache = Default::default();
         self.scenes.clear();
+        if let Ok(grid) = self.grid.get_mut() {
+            grid.clear();
+        }
+        self.panels.clear();
         self.part_meshes.clear();
         self.block_meshes = Default::default();
         self.window = None;
@@ -563,7 +576,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
         app.canvas.list_gen = app.canvas.list_gen.wrapping_add(1);
         // Retain a few recent tabs, with one total geometry budget rather than one per tab.
         let budget = if app.tablet_mode { (app.tablet_prefs.cache_mib as usize) << 20 } else { 64 << 20 };
-        while app.canvas.scenes.len() > 3 || app.canvas.scenes.iter().map(Scene::bytes).sum::<usize>() > budget {
+        while app.canvas.scenes.len() > 16 || app.canvas.scenes.iter().map(Scene::bytes).sum::<usize>() > budget {
             app.canvas.scenes.pop_front();
         }
         app.canvas.enforce_cache_budget();
@@ -972,22 +985,26 @@ fn adaptive(unit: f64, scale: f64, min_px: f64) -> f64 {
 }
 
 fn draw_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
+    grid::draw(app, p, xf);
+}
+
+fn grid_shapes(app: &CadApp, xf: &Xf) -> Vec<Shape> {
+    let mut lines = Vec::new();
     let t = Tokens::get();
     let s = app.session.drafting_settings();
     let wb = xf.world_bounds();
     if s.gridmode && s.isodraft {
-        draw_iso_grid(app, p, xf);
+        lines.extend(iso_grid_shapes(app, xf));
     } else if s.gridmode {
         let major_n = f64::from(s.gridmajor.max(1));
         let unit = if s.gridunit.x == 0.0 { s.snapunit.x } else { s.gridunit.x };
         let minor = adaptive(unit, xf.scale, 8.0);
         let major = minor * major_n;
-        let mut lines = Vec::new();
         let x0 = (wb.min.x / minor).floor() as i64;
         let x1 = (wb.max.x / minor).ceil() as i64;
         let y0 = (wb.min.y / minor).floor() as i64;
         let y1 = (wb.max.y / minor).ceil() as i64;
-        if (x1 - x0) < 2000 && (y1 - y0) < 2000 {
+        if x1.saturating_sub(x0) < 2000 && y1.saturating_sub(y0) < 2000 {
             for i in x0..=x1 {
                 let x = i as f64 * minor;
                 let is_major = (x / major).round() * major - x == 0.0 || ((x / major) - (x / major).round()).abs() < 1e-6;
@@ -1007,21 +1024,21 @@ fn draw_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
                 ));
             }
         }
-        p.extend(lines);
     }
     // Axes through the origin.
     let o = xf.to_screen(Vec2::ZERO);
     if xf.rect.y_range().contains(o.y) {
-        p.line_segment([pos2(xf.rect.left(), o.y), pos2(xf.rect.right(), o.y)], Stroke::new(1.0, t.axis_x));
+        lines.push(Shape::line_segment([pos2(xf.rect.left(), o.y), pos2(xf.rect.right(), o.y)], Stroke::new(1.0, t.axis_x)));
     }
     if xf.rect.x_range().contains(o.x) {
-        p.line_segment([pos2(o.x, xf.rect.top()), pos2(o.x, xf.rect.bottom())], Stroke::new(1.0, t.axis_y));
+        lines.push(Shape::line_segment([pos2(o.x, xf.rect.top()), pos2(o.x, xf.rect.bottom())], Stroke::new(1.0, t.axis_y)));
     }
+    lines
 }
 
 /// The isometric grid (SNAPSTYL 1): lines at 30°, 90° and 150° through the snap lattice, GRIDUNIT
 /// Y apart along the axes, coarsened while they would crowd closer than 8 pixels.
-fn draw_iso_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
+fn iso_grid_shapes(app: &CadApp, xf: &Xf) -> Vec<Shape> {
     use cadcraft_engine::snap::iso;
     let t = Tokens::get();
     let s = app.session.drafting_settings();
@@ -1034,11 +1051,10 @@ fn draw_iso_grid(app: &CadApp, p: &egui::Painter, xf: &Xf) {
     }
     let (origin, angle) = app.session.doc().map(cadcraft_engine::snap::grid_frame).unwrap_or((Vec2::ZERO, 0.0));
     let lines = iso::grid_lines(xf.world_bounds(), d, origin, angle, s.gridmajor);
-    p.extend(
-        lines.into_iter().map(|l| {
-            Shape::line_segment([xf.to_screen(l.a), xf.to_screen(l.b)], Stroke::new(1.0, if l.major { t.grid_major } else { t.grid_minor }))
-        }),
-    );
+    lines
+        .into_iter()
+        .map(|l| Shape::line_segment([xf.to_screen(l.a), xf.to_screen(l.b)], Stroke::new(1.0, if l.major { t.grid_major } else { t.grid_minor })))
+        .collect()
 }
 
 fn clip_infinite(xf: &Xf, base: Vec2, dir: Vec2, ray: bool) -> Option<[Pos2; 2]> {
@@ -3124,6 +3140,7 @@ mod blockedit;
 /// The COMPARE overlay.
 mod compare;
 
+mod grid;
 /// Background rebuilds of the display list for a new view.
 mod rebuild;
 
