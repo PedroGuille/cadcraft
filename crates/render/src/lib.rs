@@ -45,6 +45,9 @@ pub const VIEWPORT_CONTENT: Handle = Handle(0);
 /// [`DisplayList::prim_layers`] of a primitive whose layer isn't in the layer table.
 pub const NO_LAYER: u32 = u32::MAX;
 
+mod analytic;
+pub use analytic::ArcHint;
+
 /// What a display-list primitive draws.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Kind {
@@ -81,6 +84,8 @@ pub struct DPrim {
 
 #[derive(Clone, Debug, Default)]
 pub struct DisplayList {
+    /// Optional GPU curves, ordered by primitive index; CPU geometry remains complete.
+    pub analytic: Vec<ArcHint>,
     pub prims: Vec<DPrim>,
     pub verts: Vec<Vec2>,
     pub tris: Vec<Vec2>,
@@ -1214,6 +1219,7 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
         }
         None => b.polyline(ctx, rgb, lw, pts),
     };
+    let first = b.list.prims.len();
     match &e.kind {
         EntityKind::Text(t) => {
             if !b.opts.text {
@@ -1407,6 +1413,15 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
                 }
             }
         }
+    }
+
+    if b.sharing
+        && lt.is_none()
+        && b.list.prims.len() == first + 1
+        && b.list.prims.get(first).is_some_and(|p| p.kind == Kind::Polyline && p.len >= 10 && p.lw <= 0.0)
+        && let Some(hint) = ArcHint::new(&e.kind, ctx.xf, first, b.opts.tolerance)
+    {
+        b.list.analytic.push(hint);
     }
 }
 

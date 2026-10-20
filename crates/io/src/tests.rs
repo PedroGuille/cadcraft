@@ -4,7 +4,7 @@ use cadcraft_geom::{PolyVertex, Vec2, Vec3};
 
 use crate::*;
 
-fn sample() -> Drawing {
+pub(super) fn sample() -> Drawing {
     let mut d = Drawing::new_imperial();
     d.layers.push(Layer { name: "Walls".into(), color: Color::Index(1), ..Layer::default() });
     let c = |l: &str| Common { layer: l.into(), ..Common::default() };

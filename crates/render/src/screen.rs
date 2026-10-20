@@ -4,6 +4,10 @@
 //! the full builder; a screen list preserves entity order, including wipeout barriers.
 
 mod blocks;
+mod spatial;
+
+type ChunkKey = (usize, usize);
+const SPATIAL_CHUNK: usize = 128;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -290,20 +294,22 @@ pub struct Cache {
     drawing: Option<Arc<Drawing>>,
     options: Option<Options>,
     font_revision: u64,
-    chunks: HashMap<usize, Part>,
+    chunks: HashMap<ChunkKey, Part>,
     // Weak references reuse the active scene even when the retention budget is zero.
-    active: HashMap<usize, (u64, std::sync::Weak<DisplayList>, std::sync::Weak<[BlockInstance]>, std::sync::Weak<Damage>, Option<Bounds2>)>,
+    active: HashMap<ChunkKey, (u64, std::sync::Weak<DisplayList>, std::sync::Weak<[BlockInstance]>, std::sync::Weak<Damage>, Option<Bounds2>)>,
     context: u64,
     limit: usize,
     templates: Arc<std::sync::Mutex<blocks::Templates>>,
     views: VecDeque<Variant>,
+    spatial: bool,
+    spatial_index: spatial::Cache,
 }
 
 #[derive(Clone)]
 struct Variant {
     _drawing: Arc<Drawing>,
     options: Options,
-    chunks: HashMap<usize, Part>,
+    chunks: HashMap<ChunkKey, Part>,
     templates: Arc<std::sync::Mutex<blocks::Templates>>,
     context: u64,
 }
@@ -326,11 +332,42 @@ impl Default for Cache {
             limit: MAX_BYTES,
             templates: Default::default(),
             views: VecDeque::new(),
+            spatial: false,
+            spatial_index: Default::default(),
         }
     }
 }
 
 impl Cache {
+    pub fn set_spatial_partition(&mut self, enabled: bool) {
+        if self.spatial != enabled {
+            let limit = self.limit;
+            *self = Self { limit, spatial: enabled, ..Self::default() };
+        }
+    }
+
+    fn source_chunks<'a>(&self, drawing: &'a Drawing, masks: Option<&HashMap<usize, Vec<bool>>>) -> Vec<(ChunkKey, &'a [Arc<Entity>])> {
+        let mut chunks = Vec::new();
+        for (key, entities) in drawing.model.chunk_slices() {
+            let mask = masks.and_then(|m| m.get(&key));
+            // Keep the original large batches for an overview or mostly unknown geometry.
+            // Subdivision pays for itself when it can reject a substantial part of the chunk.
+            let coarse = !self.spatial || masks.is_some() && mask.is_none_or(|m| m.iter().filter(|v| **v).count() * 4 >= entities.len() * 3);
+            if coarse {
+                chunks.push(((key, 0), entities));
+            } else {
+                for (offset, entities) in entities.chunks(SPATIAL_CHUNK).enumerate() {
+                    let visible = mask.and_then(|m| m.get(offset * SPATIAL_CHUNK..offset * SPATIAL_CHUNK + entities.len()));
+                    if visible.is_none_or(|m| m.iter().any(|v| *v)) {
+                        // Zero identifies the coarse batch; fine batches have distinct keys.
+                        chunks.push(((key, offset + 1), entities));
+                    }
+                }
+            }
+        }
+        chunks
+    }
+
     pub fn bytes(&self) -> usize {
         // A worker may be tessellating a template: memory accounting must not stall the UI.
         let templates = self.templates.try_lock().map_or((self.limit / 4).min(128 << 20), |c| c.bytes);
@@ -339,11 +376,13 @@ impl Cache {
             .fold(0usize, |n, p| n.saturating_add(p.bytes()))
             .saturating_add(templates)
             .saturating_add(self.views.iter().fold(0usize, |n, v| n.saturating_add(v.bytes())))
+            .saturating_add(self.spatial_index.bytes())
     }
 
     /// Retain as many individual chunks as fit; the active drawing is never truncated.
     pub fn set_budget(&mut self, bytes: usize) {
         self.limit = bytes;
+        self.spatial_index.trim(bytes / 8);
         while !self.views.is_empty() && self.bytes() > bytes {
             self.views.pop_front();
         }
@@ -363,7 +402,8 @@ impl Cache {
                 self.templates = Arc::new(std::sync::Mutex::new(templates));
                 0
             })
-            .saturating_add(history);
+            .saturating_add(history)
+            .saturating_add(self.spatial_index.bytes());
         self.chunks.retain(|_, part| {
             let size = part.bytes();
             if size > self.limit.saturating_sub(used) {
@@ -383,9 +423,8 @@ impl Cache {
         let reusable = self.font_revision == font_revision()
             && self.options.as_ref().is_some_and(|o| same_options(o, &options))
             && self.drawing.as_ref().is_some_and(|d| d.same_render_context(drawing));
-        drawing
-            .model
-            .chunk_slices()
+        self.source_chunks(drawing, None)
+            .into_iter()
             .filter(|(key, _)| {
                 !reusable || !(self.chunks.contains_key(key) || self.active.get(key).is_some_and(|(_, p, _, _, _)| p.strong_count() > 0))
             })
@@ -413,8 +452,8 @@ impl Cache {
 
     pub fn build_scene(&mut self, drawing: &Arc<Drawing>, space: &Space, options: &Options) -> SceneBuilt {
         let fallback = |this: &mut Self| {
-            let limit = this.limit;
-            *this = Self { limit, ..Self::default() };
+            let (limit, spatial) = (this.limit, this.spatial);
+            *this = Self { limit, spatial, ..Self::default() };
             SceneBuilt { scene: Scene::from_list(crate::build(drawing, space, options)), rebuilt: 0, reused: 0 }
         };
         if *space != Space::Model || options.plot_style_table.is_some() {
@@ -426,6 +465,7 @@ impl Cache {
         let font_revision = cadcraft_fonts::ttf::revision();
         let context_changed = self.font_revision != font_revision || self.drawing.as_ref().is_none_or(|d| !d.same_render_context(drawing));
         if context_changed {
+            self.spatial_index = Default::default();
             self.views.clear();
             self.chunks.clear();
             self.active.clear();
@@ -485,7 +525,8 @@ impl Cache {
                 });
             }
         }
-        let chunks: Vec<_> = drawing.model.chunk_slices().collect();
+        let masks = if self.spatial { self.spatial_index.masks(drawing, options.view, options.tolerance, self.limit / 8) } else { HashMap::new() };
+        let chunks = self.source_chunks(drawing, Some(&masks));
         let used: usize = chunks.iter().filter_map(|(k, _)| self.chunks.get(k)).map(|p| p.list.expanded).sum();
         // A cached part must not give a new part a fresh block-expansion allowance.
         if used >= MAX_BLOCK_EXPANSION {
@@ -493,12 +534,12 @@ impl Cache {
         }
         let budget = AtomicUsize::new(used);
         let missing: Vec<_> = chunks.iter().filter(|(k, _)| !self.chunks.contains_key(k)).collect();
-        let make = |&&(key, ents): &&(usize, &[Arc<Entity>])| {
+        let make = |&&(key, ents): &&(ChunkKey, &[Arc<Entity>])| {
             let stable_options = Options { view: None, ..options.clone() };
             // Build complete ordinary chunks only once they touch a visited area. Entirely
             // distant chunks keep the original conservative culling; pressure disables this
             // optional prefetch. Hatches and objects containing blocks stay view dependent.
-            let whole = self.limit >= 8 << 20 && view_independent(ents) && ents.iter().any(|e| visible(drawing, e, &options));
+            let whole = !self.spatial && self.limit >= 8 << 20 && view_independent(ents) && ents.iter().any(|e| visible(drawing, e, &options));
             let build_options = if whole { &stable_options } else { &options };
             let mut b = Builder {
                 list: DisplayList::default(),
@@ -512,7 +553,10 @@ impl Cache {
                 instances: Vec::new(),
             };
             let mut damage = Damage { context: self.context, entities: Vec::with_capacity(ents.len()) };
-            for e in ents {
+            for (offset, e) in ents.iter().enumerate() {
+                if masks.get(&key.0).and_then(|m| m.get(key.1.saturating_sub(1) * SPATIAL_CHUNK + offset)).is_some_and(|show| !show) {
+                    continue;
+                }
                 let first = b.list.prims.len();
                 let instance = b.instances.len();
                 if visible(drawing, e, build_options) && !blocks::draw(&self.templates, &mut b, drawing, e) {
@@ -570,8 +614,12 @@ impl Cache {
         drop(lists);
         let mut next = HashMap::new();
         let mut parts = Vec::new();
-        let mut retained =
-            self.templates.lock().map_or(0, |c| c.bytes).saturating_add(self.views.iter().fold(0usize, |n, v| n.saturating_add(v.bytes())));
+        let mut retained = self
+            .templates
+            .lock()
+            .map_or(0, |c| c.bytes)
+            .saturating_add(self.views.iter().fold(0usize, |n, v| n.saturating_add(v.bytes())))
+            .saturating_add(self.spatial_index.bytes());
         self.active.clear();
         for (key, _) in chunks {
             let Some(part) = made.remove(&key).or_else(|| self.chunks.remove(&key)) else { return fallback(self) };
@@ -596,7 +644,8 @@ impl Cache {
         self.options = Some(options);
         self.font_revision = font_revision;
         self.drawing = Some(Arc::new((**drawing).clone()));
-        SceneBuilt { reused: drawing.model.chunk_slices().count().saturating_sub(rebuilt), rebuilt, scene: Scene::from_parts(parts) }
+        let reused = parts.len().saturating_sub(rebuilt);
+        SceneBuilt { reused, rebuilt, scene: Scene::from_parts(parts) }
     }
 }
 
@@ -665,4 +714,5 @@ pub fn bytes(list: &DisplayList) -> usize {
         .saturating_mul(std::mem::size_of::<crate::DPrim>())
         .saturating_add(list.verts.capacity().saturating_mul(std::mem::size_of::<cadcraft_geom::Vec2>()))
         .saturating_add(list.tris.capacity().saturating_mul(std::mem::size_of::<cadcraft_geom::Vec2>()))
+        .saturating_add(list.analytic.capacity().saturating_mul(std::mem::size_of::<crate::ArcHint>()))
 }

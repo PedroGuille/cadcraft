@@ -365,6 +365,8 @@ impl InstanceData {
             opaque: self.opaque,
             placements: None,
             spatial: None,
+            packed: None,
+            analytic: false,
             glyphs: Some(Arc::new(Placements { page: self.page.clone(), bounds: self.bounds.clone() })),
         };
         match self.lane {

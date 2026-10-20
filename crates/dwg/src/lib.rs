@@ -102,6 +102,67 @@ mod native {
         Ok((add_header_vars(out.buf, &doc.header), notes))
     }
 
+    /// Stream a DWG rendition to host-private storage. The decoded DWG is released before
+    /// CADCraft starts mapping the DXF records, without retaining a drawing-sized text Vec.
+    /// The additional header variables follow the same compatibility rules as the byte API.
+    pub fn dwg_to_dxf_writer(
+        bytes: &[u8],
+        limits: Limits,
+        output: &mut impl Write,
+    ) -> Result<(Vec<String>, Vec<(&'static str, i32, String)>), String> {
+        if bytes.len() > limits.max_dwg_bytes {
+            return Err(format!("DWG: the file is {}, larger than the {} CADCraft opens", mb(bytes.len() as u64), mb(limits.max_dwg_bytes as u64)));
+        }
+        let outcome = std::panic::catch_unwind(|| {
+            acadrust::DwgReader::from_stream_with_options(Cursor::new(bytes), acadrust::DwgReadOptions::failsafe()).read_with_stats()
+        })
+        .map_err(|_| "the DWG reader failed on this file".to_string())?
+        .map_err(|e| format!("DWG: {e}"))?;
+        if !outcome.stats.record_stream_read {
+            let why = outcome.stats.diagnostics.first().map(|d| d.message.trim_start_matches("Failsafe: ").to_string());
+            return Err(format!("DWG: {}", why.unwrap_or_else(|| "the file's objects couldn't be read".to_string())));
+        }
+        let notes = read_notes(&outcome.stats);
+        let mut doc = outcome.document;
+        table_merges(&mut doc);
+        table_style_rows(&mut doc, false);
+        let mut out = CappedOutput { output, bytes: 0, limit: limits.max_dxf_bytes, exceeded: false };
+        let written = std::panic::catch_unwind(AssertUnwindSafe(|| acadrust::DxfWriter::new(&doc).write_to_writer(&mut out)))
+            .map_err(|_| "the DWG→DXF conversion failed on this file".to_string())?;
+        if out.exceeded {
+            return Err(format!(
+                "DWG: converting this {} file produced more than {} of drawing data (the limit)",
+                mb(bytes.len() as u64),
+                mb(limits.max_dxf_bytes as u64)
+            ));
+        }
+        written.map_err(|e| format!("DWG→DXF: {e}"))?;
+        out.flush().map_err(|e| format!("DWG temporary storage: {e}"))?;
+        Ok((notes, unwritten_header_vars(&doc.header).into_iter().collect()))
+    }
+
+    struct CappedOutput<'a, W> {
+        output: &'a mut W,
+        bytes: usize,
+        limit: usize,
+        exceeded: bool,
+    }
+
+    impl<W: Write> Write for CappedOutput<'_, W> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let Some(total) = self.bytes.checked_add(bytes.len()).filter(|n| *n <= self.limit && !self.exceeded) else {
+                self.exceeded = true;
+                return Err(std::io::Error::other("DXF size limit reached"));
+            };
+            self.output.write_all(bytes)?;
+            self.bytes = total;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.output.flush()
+        }
+    }
+
     /// Most record types named in the skipped-records note.
     const NOTE_TYPES: usize = 6;
 
@@ -407,7 +468,7 @@ mod native {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{dwg_to_dxf, dwg_to_dxf_noted, dwg_to_dxf_with, dxf_to_dwg, dxf_to_dwg_as};
+pub use native::{dwg_to_dxf, dwg_to_dxf_noted, dwg_to_dxf_with, dwg_to_dxf_writer, dxf_to_dwg, dxf_to_dwg_as};
 
 /// The error for a DWG version CADCraft can't write.
 #[cfg_attr(target_arch = "wasm32", allow(dead_code))]

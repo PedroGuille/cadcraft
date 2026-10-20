@@ -493,6 +493,7 @@ fn prim_color32(prim: &cadcraft_render::DPrim, bg: Rgb) -> Color32 {
 /// background while the current list is drawn (see [`rebuild`]). Expensive edits use the same
 /// bounded worker; small edits and platforms without threads rebuild immediately.
 fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::Context) {
+    app.canvas.render_cache.set_spatial_partition(app.tablet_mode);
     let now = ctx.input(|i| i.time);
     let current = app.canvas.xf.map_or((xf.center, xf.scale), |active| (active.center, active.scale));
     if app.tablet_mode && app.canvas.navigation_view.is_some_and(|old| old != current) {
@@ -644,6 +645,7 @@ fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], ctx: &egui::
             queue: app.canvas.gpu_queue.clone(),
             parts: app.canvas.part_meshes.clone(),
             blocks: app.canvas.block_meshes.clone(),
+            compact: app.tablet_mode,
         });
         let window = opts.view;
         let req = rebuild::Request { doc: st.doc.clone(), space: st.space.clone(), opts: opts.clone(), mesh, cache: app.canvas.render_cache.clone() };
@@ -1285,7 +1287,15 @@ fn draw_list_gpu(c: &mut CanvasState, p: &egui::Painter, xf: &Xf, bg: Rgb, lwdis
             for part in &list.parts {
                 let id = part_mesh_key(part.id, origin, bg, lwdisplay);
                 let data = c.part_meshes.get(&id).cloned().unwrap_or_else(|| {
-                    let data = Arc::new(crate::gpu::blocks::build_part(part, origin, bg, lwdisplay, &c.block_meshes));
+                    let data = crate::gpu::blocks::build_part_with_precision(
+                        part,
+                        origin,
+                        bg,
+                        lwdisplay,
+                        &c.block_meshes,
+                        if c.cache_limit.is_some() { 1.0 / xf.scale.max(1e-300) * 0.0625 } else { 0.0 },
+                    );
+                    let data = Arc::new(data);
                     c.mesh_bytes = c.mesh_bytes.saturating_add(data.bytes());
                     data
                 });

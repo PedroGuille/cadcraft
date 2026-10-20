@@ -161,8 +161,15 @@ pub(super) struct Placements {
 /// Convert shared CPU geometry directly to shared GPU buffers. Precision-sensitive or
 /// over-budget placements expand only while building their fallback upload, never in the scene.
 pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Cache>) -> MeshData {
+    build_part_with_precision(part, origin, bg, lw, cache, 0.0)
+}
+
+/// Tablet upload with a bounded additional display error; exact CPU geometry stays intact.
+pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Cache>, error: f64) -> MeshData {
     if part.instances.is_empty() {
-        return build_mesh(&part.list, origin, bg, lw);
+        let mut mesh = curves::build(&part.list, origin, bg, lw, error);
+        mesh.set_display_precision(error);
+        return mesh;
     }
     let mut cache = cache.try_lock().ok();
     let glyphs = cache.as_mut().map(|c| c.glyphs.prepare(&part.instances));
@@ -176,7 +183,7 @@ pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Ca
         if instance.glyph
             && let Some((data, count)) = glyphs.as_ref().and_then(|g| g.batch(&part.instances[at..], origin, bg, lw))
         {
-            flush(&mut pending, &mut mesh, origin, bg, lw);
+            flush(&mut pending, &mut mesh, origin, bg, lw, error);
             mesh.parts.push((0, Arc::new(MeshData { glyphs: Some(data), ..Default::default() })));
             at += count;
             continue;
@@ -214,12 +221,13 @@ pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Ca
             at += 1;
             continue;
         }
-        flush(&mut pending, &mut mesh, origin, bg, lw);
+        flush(&mut pending, &mut mesh, origin, bg, lw, error);
         mesh.parts.push((0, Arc::new(MeshData { instance: Some(data), ..Default::default() })));
         at = end;
     }
     append_prims(&mut pending, &part.list, part.list.prims.get(first..).unwrap_or(&[]), cadcraft_geom::Mat3::IDENTITY, None);
-    flush(&mut pending, &mut mesh, origin, bg, lw);
+    flush(&mut pending, &mut mesh, origin, bg, lw, error);
+    mesh.set_display_precision(error);
     mesh
 }
 
@@ -240,13 +248,23 @@ fn append_prims(
         p.start = target.len() as u32;
         p.handle = handle.unwrap_or(p.handle);
         target.extend(src.points(source).iter().map(|p| xf.apply(*p)));
+        if xf == cadcraft_geom::Mat3::IDENTITY {
+            // Hints carry a primitive index, but source slices may start in the middle.
+            if let Some(hint) = src
+                .analytic
+                .get(src.analytic.partition_point(|h| src.prims.get(h.prim).is_some_and(|q| q.start < source.start)))
+                .filter(|h| src.prims.get(h.prim).is_some_and(|q| q.start == source.start && q.kind == source.kind))
+            {
+                dst.analytic.push(cadcraft_render::ArcHint { prim: dst.prims.len(), ..*hint });
+            }
+        }
         dst.prims.push(p);
     }
 }
 
-fn flush(pending: &mut DisplayList, mesh: &mut MeshData, origin: Vec2, bg: Rgb, lw: bool) {
+fn flush(pending: &mut DisplayList, mesh: &mut MeshData, origin: Vec2, bg: Rgb, lw: bool, error: f64) {
     if !pending.prims.is_empty() {
-        mesh.parts.push((0, Arc::new(build_mesh(pending, origin, bg, lw))));
+        mesh.parts.push((0, Arc::new(curves::build(pending, origin, bg, lw, error))));
         *pending = DisplayList::default();
     }
 }

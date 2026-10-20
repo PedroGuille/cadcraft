@@ -92,7 +92,7 @@ pub(crate) fn decode(bytes: &[u8], d: Decoder) -> Cow<'_, str> {
 /// The `$DWGCODEPAGE` value of an ASCII DXF file: the line two lines after a `$DWGCODEPAGE`
 /// line (the group code `3` between them), looked for in the HEADER section only (the scan stops
 /// at the first `ENDSEC`). Works on the raw bytes, before they are decoded.
-fn ascii_code_page(bytes: &[u8]) -> Option<&[u8]> {
+pub(crate) fn ascii_code_page(bytes: &[u8]) -> Option<&[u8]> {
     let mut lines = bytes.split(|&b| b == b'\n').map(<[u8]>::trim_ascii);
     while let Some(line) = lines.next() {
         if line == b"ENDSEC" {

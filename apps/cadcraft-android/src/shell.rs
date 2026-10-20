@@ -144,6 +144,7 @@ fn files(dir: &Path) -> Vec<PathBuf> {
 impl Shell {
     pub fn new(cc: &eframe::CreationContext<'_>, dir: PathBuf) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         std::fs::create_dir_all(&dir)?;
+        cadcraft_io::set_import_work_dir(dir.join("import-work"));
         install_io();
         let save_dir = dir.clone();
         let services = Services {

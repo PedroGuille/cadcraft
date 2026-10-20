@@ -40,6 +40,7 @@ pub(super) struct MeshRequest {
     pub model_bg: Rgb,
     pub paper_bg: Rgb,
     pub lwdisplay: bool,
+    pub compact: bool,
     /// Create the GPU buffers on the worker too, so the frame that swaps the list in only swaps
     /// buffers (`None`: the paint callback uploads them).
     pub device: Option<egui_wgpu::wgpu::Device>,
@@ -133,7 +134,14 @@ fn run(mut req: Request) -> Option<Built> {
                 }
                 let id = super::part_mesh_key(part.id, origin, bg, m.lwdisplay);
                 let mesh = m.parts.get(&id).cloned().unwrap_or_else(|| {
-                    let mut mesh = crate::gpu::blocks::build_part(part, origin, bg, m.lwdisplay, &m.blocks);
+                    let mut mesh = crate::gpu::blocks::build_part_with_precision(
+                        part,
+                        origin,
+                        bg,
+                        m.lwdisplay,
+                        &m.blocks,
+                        if m.compact { req.opts.tolerance.abs() * 0.125 } else { 0.0 },
+                    );
                     if let (Some(device), Some(queue)) = (&m.device, &m.queue) {
                         mesh.upload_now(device, queue);
                     }
@@ -250,6 +258,7 @@ mod tests {
                 model_bg: Rgb(0, 0, 0),
                 paper_bg: Rgb(255, 255, 255),
                 lwdisplay: false,
+                compact: false,
                 device: None,
                 queue: None,
                 parts: Default::default(),

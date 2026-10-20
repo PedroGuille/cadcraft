@@ -176,3 +176,100 @@ fn clipped_viewport_contents_draw_only_inside_their_outline() {
     // wgpu reported nothing (validation errors land in the faults instead of panicking).
     assert_eq!(faults.take(), None);
 }
+
+#[test]
+fn tablet_compact_buffers_and_analytic_curves_preserve_visible_geometry() {
+    use cadcraft_doc::{Arc as CadArc, Circle, Common, Drawing, EntityKind, Space};
+    use cadcraft_geom::Vec3;
+    use cadcraft_render::{Options, screen::Cache};
+
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    let faults = Arc::new(GpuFaults::default());
+    gpu::install(&rs, &faults, Some(STENCIL));
+    let mut drawing = Drawing::new_imperial();
+    let mut centers = Vec::new();
+    for i in 0..8 {
+        let center = Vec3::new(9.0 + f64::from(i % 4) * 15.0, if i < 4 { 18.0 } else { 46.0 }, 0.0);
+        centers.push(center.xy());
+        let kind = if i < 4 {
+            EntityKind::Circle(Circle { center, radius: 5.0 })
+        } else {
+            EntityKind::Arc(CadArc { center, radius: 5.0, start: 0.0, end: std::f64::consts::PI * 1.5 })
+        };
+        drawing.add(&Space::Model, Common::default(), kind).unwrap();
+    }
+    let drawing = Arc::new(drawing);
+    let options = Options { tolerance: 0.125, ..Default::default() };
+    let baseline = cadcraft_render::build(&drawing, &Space::Model, &options);
+    let mut cache = Cache::default();
+    cache.set_spatial_partition(true);
+    let scene = cache.build_scene(&drawing, &Space::Model, &options).scene;
+    let mut compact = gpu::MeshData::default();
+    let templates = Default::default();
+    for part in &scene.parts {
+        compact.parts.push((
+            part.id,
+            Arc::new(gpu::blocks::build_part_with_precision(part, Vec2::ZERO, cadcraft_color::Rgb(255, 255, 255), false, &templates, 0.015625)),
+        ));
+    }
+    assert!(compact.bytes() < gpu::build_mesh(&baseline, Vec2::ZERO, cadcraft_color::Rgb(255, 255, 255), false).bytes() / 2);
+    let old = render(&rs, &[callback(&baseline, LAYER_VIEWPORT, 10, Stencil::Off)]);
+    let slot: MeshSlot = Arc::default();
+    *slot.lock().unwrap() = Some(compact);
+    let new_callback = CanvasCallback { slot, ..callback(&baseline, LAYER_VIEWPORT, 11, Stencil::Off) };
+    let new = render(&rs, std::slice::from_ref(&new_callback));
+    if let Ok(directory) = std::env::var("CADCRAFT_GPU_CHECK_DIR") {
+        std::fs::create_dir_all(&directory).unwrap();
+        let picture = image::RgbImage::from_fn(SIZE, SIZE, |x, y| image::Rgb(if dark(&new, x, y) { [0, 0, 0] } else { [255, 255, 255] }));
+        picture.save(std::path::Path::new(&directory).join("analytic-curves.png")).unwrap();
+    }
+    assert!(new.iter().filter(|p| **p).count() > 100, "the analytic instances were drawn");
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let at = (y * SIZE + x) as usize;
+            let world = Vec2::new(f64::from(x) + 0.5, 64.0 - f64::from(y) - 0.5);
+            if old[at] != new[at] {
+                assert!(centers.iter().any(|c| (world.dist(*c) - 5.0).abs() <= 1.5), "difference away from a curve: {x},{y}");
+            }
+        }
+    }
+    for c in &centers {
+        assert!(!dark(&new, c.x as u32, (64.0 - c.y) as u32), "circle interiors stay empty");
+    }
+    for c in centers.iter().skip(4) {
+        assert!(!dark(&new, (c.x + 3.0) as u32, (64.0 - c.y + 3.0) as u32), "missing arc quadrant stays empty");
+    }
+    let left_half = [Vec2::ZERO, Vec2::new(32.0, 0.0), Vec2::new(32.0, 64.0), Vec2::new(0.0, 64.0), Vec2::ZERO];
+    let mut clipped_curve = new_callback;
+    clipped_curve.stencil = Stencil::Inside;
+    let clipped = render(&rs, &[callback(&fan(&left_half), LAYER_MASK, 20, Stencil::Mask), clipped_curve]);
+    assert!(clipped.iter().filter(|p| **p).count() > 40);
+    assert!((0..SIZE).all(|y| (33..SIZE).all(|x| !dark(&clipped, x, y))));
+
+    // Dense filled geometry exercises the normalized-integer vertex pipeline, including
+    // opaque writes and stencil clipping. Vertices sit clear of pixel centres.
+    let mut vertices = Vec::new();
+    for y in 0..8 {
+        for x in 0..8 {
+            let a = Vec2::new(f64::from(x) * 8.0 + 0.25, f64::from(y) * 8.0 + 0.25);
+            let b = a + Vec2::new(4.0, 0.0);
+            let c = a + Vec2::new(4.0, 4.0);
+            let d = a + Vec2::new(0.0, 4.0);
+            vertices.extend([a, b, c, a, c, d]);
+        }
+    }
+    let list = tris(vertices);
+    let mut mesh = gpu::build_mesh(&list, Vec2::ZERO, cadcraft_color::Rgb(255, 255, 255), false);
+    mesh.set_display_precision(0.01);
+    let packed: MeshSlot = Arc::default();
+    *packed.lock().unwrap() = Some(mesh);
+    let packed = CanvasCallback { slot: packed, ..callback(&list, LAYER_VIEWPORT, 13, Stencil::Off) };
+    let packed_pixels = render(&rs, std::slice::from_ref(&packed));
+    let mut clipped_packed = packed;
+    clipped_packed.stencil = Stencil::Inside;
+    let clipped = render(&rs, &[callback(&fan(&left_half), LAYER_MASK, 20, Stencil::Mask), clipped_packed]);
+    assert!(clipped.iter().any(|p| *p));
+    assert!((0..SIZE).all(|y| (33..SIZE).all(|x| !dark(&clipped, x, y))));
+    assert_eq!(packed_pixels, render(&rs, &[callback(&list, LAYER_VIEWPORT, 14, Stencil::Off)]));
+    assert_eq!(faults.take(), None);
+}

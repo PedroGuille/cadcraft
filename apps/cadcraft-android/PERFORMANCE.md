@@ -163,3 +163,43 @@ Widgets and input handling remain live, and both caches release retained data un
 Regression checks compare cached/uncached snapping and full-detail geometry, reuse after view
 changes, invalidation after edits/undo, memory-pressure fallback and direct/retained GPU pixels.
 Android device FPS, power and thermal behavior still need measurements on real tablets.
+
+## Lower import and display memory (Android 0.1.4)
+
+Native imports of ASCII DXF and DWG files of at least 4 MiB use a replayable tag reader.
+DWG conversion writes to a bounded, host-private temporary DXF rather than retaining its full
+text and tag vector alongside the decoded CAD objects. Symbol tables, layouts, object metadata
+and foreign extras are retained; graphical entity sequences are mapped directly into COW stores.
+The conversion document is released before mapping. Work files are deleted on exit from the
+import, and old abandoned work files are cleaned up on startup. A full disk returns an import
+error. The original bytes and acadrust's decoded DWG database still need memory; this is not
+a direct DWG-to-drawing mapper or an out-of-core document database. Small files, binary DXF
+and WebAssembly retain their existing readers.
+
+Tablet model-space scenes split sparsely visible immutable source chunks into ordered groups
+of 128 entities. Mostly visible chunks retain their original large batches, preserving overview
+draw-call counts; entirely rejected fine groups need no display part.
+A budgeted spatial directory rejects safely bounded entities before tessellation. Text,
+dimensions, wipeouts, annotative objects and uncertain bounds retain conservative handling.
+Blocks with compatible finite contents have transformed bounds, including rotated arrays and
+negative scales. Source order is never spatially sorted. Existing cached zoom/view variants
+remain reusable, and edits or style changes invalidate affected geometry.
+
+Ordinary GPU geometry pages can encode display positions as two normalized 16-bit integers
+instead of two 32-bit floats. Premultiplied colour remains unchanged: payload is 8 rather than
+12 bytes per vertex, plus a 24-byte transform per page. Each page checks quantization and
+floating-point error against an additional display allowance of about 1/16 pixel at build time;
+unrepresentable or precision-sensitive pages retain the original format. Bounds and CPU
+geometry stay unquantized. Shared block/glyph templates keep their existing instanced format.
+
+Consecutive runs of at least four eligible small, continuous, thin circles/arcs use analytic
+GPU instances (36 bytes per curve), retaining their position among line batches and wipeout
+groups. The shader evaluates the ring and arc endpoints. Large curves, patterned or wide
+strokes, unsupported transforms, isolated curves and precision-sensitive placements keep the
+segment path. Restricting quad coverage to small symbols avoids excessive fragment shading.
+Exact drawing coordinates, snapping, software rendering and all exports remain unchanged.
+
+Validation compares streamed and ordinary imports, rendered spatial selection before and after
+pans/edits, compact GPU buffers and analytic curves, including shader translation for GLES 3.0.
+These changes have not established a device-specific RAM, battery or GPU-time reduction; test
+representative drawings on the target tablet before choosing a cache allowance.

@@ -10,6 +10,8 @@ use cadcraft_geom::{PolyVertex, Spline, Vec2, Vec3};
 use crate::{IoError, Result};
 
 pub(crate) mod mtext_dxf;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod streaming;
 
 /// Value lookup helpers over an entity's tags.
 struct T<'a>(&'a [Tag]);
@@ -1648,7 +1650,15 @@ fn ltype_pattern(tags: &[Tag], styles: &HashMap<String, String>) -> Vec<DashElem
 /// Read a DXF file into a drawing.
 pub fn read(bytes: &[u8]) -> Result<Drawing> {
     let tags = cadcraft_dxf::parse(bytes).map_err(|e| IoError::Format(e.to_string()))?;
-    let secs = sections(&tags);
+    read_tags(&tags, None, None)
+}
+
+type EntityLoader<'a> =
+    dyn FnMut(&mut Drawing, &mut Rx, &HashMap<String, String>, &str, &mut std::collections::BTreeMap<String, usize>) -> Result<()> + 'a;
+
+fn read_tags(tags: &[Tag], maximum: Option<Handle>, mut loader: Option<&mut EntityLoader<'_>>) -> Result<Drawing> {
+    let streamed = loader.is_some();
+    let secs = sections(tags);
     if secs.is_empty() {
         return Err(IoError::Format("no sections found".into()));
     }
@@ -1670,8 +1680,11 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             d.bump_handseed(h);
         }
     }
+    if !ours && let Some(maximum) = maximum {
+        d.bump_handseed(maximum);
+    }
     let mut skipped = std::collections::BTreeMap::new();
-    count_skipped(&mut skipped, "(no section)", outside_sections(&tags));
+    count_skipped(&mut skipped, "(no section)", outside_sections(tags));
     for s in &secs {
         match s.name.as_str() {
             "HEADER" => header(s.tags, &mut d),
@@ -1699,7 +1712,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                             j += 1;
                         }
                         let body = recs.get(i + 1..j).unwrap_or(&[]);
-                        let ents = parse_entities(body, &mut d, &mut rx, &mut n);
+                        let ents = if streamed { Vec::new() } else { parse_entities(body, &mut d, &mut rx, &mut n) };
                         blocks.push((name, base, description, ents, xref));
                         i = j + 1;
                     } else {
@@ -1713,7 +1726,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                 count_skipped(&mut skipped, "BLOCKS", n);
             }
             // A damaged file may split its entities over several ENTITIES sections (#865).
-            "ENTITIES" => {
+            "ENTITIES" if !streamed => {
                 let mut n = 0;
                 entities.extend(parse_entities(&records(s.tags), &mut d, &mut rx, &mut n));
                 count_skipped(&mut skipped, "ENTITIES", n);
@@ -1777,7 +1790,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         }
         // Generated geometry we rebuild on save: table blocks, and standard arrowhead blocks
         // nothing inserts.
-        if rx.table_blocks.contains(&up) || (crate::dxf_ext::is_standard_arrow(&name) && !rx.inserted.contains(&up)) {
+        if rx.table_blocks.contains(&up) || (!streamed && crate::dxf_ext::is_standard_arrow(&name) && !rx.inserted.contains(&up)) {
             continue;
         }
         let mut b = Block::new(&name);
@@ -1796,11 +1809,19 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
         }
         // Array parameters, with the block names the items use (other programs may rename
         // anonymous blocks); dropped when the items no longer match them.
-        b.array = rx.block_arrays.get(&up).cloned().and_then(|mut a| a.sync_names(b.entities.iter().map(|e| e.as_ref())).then_some(a));
+        b.array = rx.block_arrays.get(&up).cloned().and_then(|mut a| (streamed || a.sync_names(b.entities.iter().map(|e| e.as_ref()))).then_some(a));
         if let Some(path) = rx.xref_paths.remove(&up) {
             b.xref_path = Some(path);
         }
         d.blocks.insert(name, std::sync::Arc::new(b));
+    }
+    if let Some(load) = loader.as_mut() {
+        load(&mut d, &mut rx, &paper_block_for, &first_layout, &mut skipped)?;
+        d.blocks.retain(|name, _| !crate::dxf_ext::is_standard_arrow(name) || rx.inserted.contains(&name.to_ascii_uppercase()));
+        for block in d.blocks.values_mut() {
+            let block = std::sync::Arc::make_mut(block);
+            block.array = block.array.take().and_then(|mut a| a.sync_names(block.entities.iter().map(|e| e.as_ref())).then_some(a));
+        }
     }
     // ENTITIES section: model space, or paper space when flagged (67=1).
     for (owner, paper, e) in entities {

@@ -25,7 +25,9 @@ use egui_wgpu::wgpu::util::DeviceExt;
 
 pub mod blocks;
 mod culling;
+mod curves;
 mod image;
+mod packed;
 mod text;
 mod tiles;
 pub use image::CachedCanvasCallback;
@@ -120,9 +122,12 @@ pub struct MeshData {
     pub parts: Vec<(u64, std::sync::Arc<MeshData>)>,
     instance: Option<blocks::InstanceData>,
     glyphs: Option<text::InstanceData>,
+    curves: Option<curves::Data>,
     /// The vertex buffers already created from this data (see [`MeshData::upload_now`]); the
     /// paint callback then only swaps them in.
     uploaded: Option<Uploaded>,
+    /// Maximum additional world-space display error allowed for quantized positions.
+    pack_error: f64,
 }
 
 /// GPU buffers made ahead of the frame that draws them.
@@ -136,6 +141,10 @@ struct Uploaded {
 }
 
 impl MeshData {
+    pub fn set_display_precision(&mut self, maximum_error: f64) {
+        self.pack_error = if maximum_error.is_finite() && maximum_error > 0.0 { maximum_error } else { 0.0 };
+    }
+
     /// Create the vertex buffers now, on the calling thread, and let the CPU copy go. Making a
     /// buffer zero-fills and copies it: about 0.35 s for a million-primitive drawing, which a
     /// background rebuild does off the UI thread (see `canvas::rebuild`).
@@ -147,6 +156,7 @@ impl MeshData {
         self.parts = Vec::new();
         self.instance = None;
         self.glyphs = None;
+        self.curves = None;
     }
 
     pub fn line_vertices(&self) -> usize {
@@ -166,6 +176,7 @@ impl MeshData {
             .saturating_add(self.parts.iter().map(|(_, p)| p.bytes()).sum::<usize>())
             .saturating_add(self.instance.as_ref().map_or(0, blocks::InstanceData::bytes))
             .saturating_add(self.glyphs.as_ref().map_or(0, text::InstanceData::bytes))
+            .saturating_add(self.curves.as_ref().map_or(0, curves::Data::bytes))
     }
     pub fn cpu_bytes(&self) -> usize {
         self.lines
@@ -176,6 +187,7 @@ impl MeshData {
             .saturating_add(self.parts.iter().map(|(_, p)| p.cpu_bytes()).sum::<usize>())
             .saturating_add(self.instance.as_ref().map_or(0, blocks::InstanceData::bytes))
             .saturating_add(self.glyphs.as_ref().map_or(0, text::InstanceData::bytes))
+            .saturating_add(self.curves.as_ref().map_or(0, curves::Data::bytes))
     }
 }
 
@@ -220,14 +232,25 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
 
 fn build_mesh_prims(list: &DisplayList, prims: &[cadcraft_render::DPrim], origin: Vec2, bg: Rgb, lwdisplay: bool) -> MeshData {
     let mut m = MeshData {
-        lines: Vec::with_capacity(list.segment_count().saturating_mul(2 * VERTEX_SIZE)),
-        tris: Vec::with_capacity(list.tris.len().saturating_mul(VERTEX_SIZE)),
+        lines: Vec::with_capacity(
+            prims
+                .iter()
+                .filter(|p| p.kind == Kind::Polyline)
+                .map(|p| p.len.saturating_sub(1) as usize)
+                .sum::<usize>()
+                .saturating_mul(2 * VERTEX_SIZE),
+        ),
+        tris: Vec::with_capacity(
+            prims.iter().filter(|p| matches!(p.kind, Kind::Tris | Kind::Mask)).map(|p| p.len as usize).sum::<usize>().saturating_mul(VERTEX_SIZE),
+        ),
         quads: Vec::new(),
         breaks: Vec::new(),
         parts: Vec::new(),
         uploaded: None,
         instance: None,
         glyphs: None,
+        pack_error: 0.0,
+        curves: None,
     };
     for prim in prims {
         let col = premultiplied(prim.display_rgb(bg), prim.alpha());
@@ -422,6 +445,8 @@ struct Batch {
     placements: Option<Arc<blocks::Placements>>,
     spatial: Option<Arc<culling::Index>>,
     glyphs: Option<Arc<text::Placements>>,
+    packed: Option<Arc<packed::Page>>,
+    analytic: bool,
 }
 
 /// One uploaded mesh with its own view uniform (each callback's transform differs).
@@ -447,8 +472,15 @@ struct Layer {
 
 impl Uploaded {
     fn new(device: &wgpu::Device, queue: &wgpu::Queue, m: &MeshData) -> Self {
+        Self::with_precision(device, queue, m, m.pack_error)
+    }
+
+    fn with_precision(device: &wgpu::Device, queue: &wgpu::Queue, m: &MeshData, maximum_error: f64) -> Self {
         if let Some(uploaded) = &m.uploaded {
             return uploaded.clone();
+        }
+        if let Some(curves) = &m.curves {
+            return curves.upload(device);
         }
         if let Some(instance) = &m.instance {
             return instance.upload(device, queue);
@@ -459,18 +491,31 @@ impl Uploaded {
         if !m.parts.is_empty() {
             let mut result = Self { lines: Vec::new(), tris: Vec::new(), quads: Vec::new(), breaks: Vec::new(), bytes: 0 };
             for (_, part) in &m.parts {
-                result.append(Self::new(device, queue, part));
+                result.append(Self::with_precision(device, queue, part, maximum_error.max(part.pack_error)));
             }
             return result;
         }
         let usage = wgpu::BufferUsages::VERTEX;
         let mut data = Self {
-            lines: upload(device, "cad_lines", &m.lines, VERTEX_SIZE, usage),
-            tris: upload(device, "cad_fills", &m.tris, VERTEX_SIZE, usage),
-            quads: upload(device, "cad_quads", &m.quads, INSTANCE_SIZE, usage),
+            lines: upload(device, "cad_lines", &m.lines, VERTEX_SIZE, usage, maximum_error),
+            tris: upload(device, "cad_fills", &m.tris, VERTEX_SIZE, usage, maximum_error),
+            quads: upload(device, "cad_quads", &m.quads, INSTANCE_SIZE, usage, 0.0),
             breaks: m.breaks.clone(),
-            bytes: m.bytes(),
+            bytes: 0,
         };
+        // wgpu hashes buffer handle identity, which is stable even when its contents change.
+        #[allow(clippy::mutable_key_type)]
+        let mut buffers = std::collections::HashSet::new();
+        for batch in data.lines.iter().chain(&data.tris).chain(&data.quads) {
+            if buffers.insert(batch.buffer.clone()) {
+                data.bytes = data.bytes.saturating_add(batch.buffer.size() as usize);
+            }
+            if let Some(page) = &batch.packed
+                && buffers.insert(page.transform.clone())
+            {
+                data.bytes = data.bytes.saturating_add(page.transform.size() as usize);
+            }
+        }
         data.bytes = data.bytes.saturating_add(
             data.lines.iter().chain(&data.tris).chain(&data.quads).filter_map(|b| b.spatial.as_ref()).map(|i| i.bytes()).sum::<usize>(),
         );
@@ -575,6 +620,8 @@ struct Resources {
     quad_pipeline: wgpu::RenderPipeline,
     block_pipeline: [wgpu::RenderPipeline; 3],
     glyph_pipeline: [wgpu::RenderPipeline; 6],
+    packed_pipeline: Vec<wgpu::RenderPipeline>,
+    curve_pipeline: [wgpu::RenderPipeline; 2],
     opaque_pipeline: [wgpu::RenderPipeline; 6],
     /// With a stencil buffer: the pipelines of [`Stencil::Mask`] and [`Stencil::Inside`].
     clipped: Option<ClipPipelines>,
@@ -697,6 +744,40 @@ fn vs_block_quad(@builtin(vertex_index) vi: u32, @location(0) a: vec2<f32>,
     @location(3) width: f32, @location(4) start: f32,
     @location(5) m: vec4<f32>, @location(6) t: vec2<f32>) -> VOut {
     return wide_quad(vi % 6u, placed(a, m, t), placed(b, m, t), color, width, start);
+}
+
+struct CurveOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+    @location(1) local: vec2<f32>,
+    @location(2) @interpolate(flat) shape: vec4<f32>, // radius, pixels/unit, sweep class
+    @location(3) @interpolate(flat) directions: vec4<f32>,
+};
+@vertex
+fn vs_curve(@builtin(vertex_index) vi: u32, @location(0) center: vec2<f32>,
+    @location(1) radius: f32, @location(2) color: vec4<f32>,
+    @location(3) directions: vec4<f32>, @location(4) mode: f32) -> CurveOut {
+    let scale = max(length(view.d.xy) * view.a.z, 0.000001);
+    let extent = radius + 1.0 / scale;
+    let x = select(-1.0, 1.0, vi == 1u || vi == 4u || vi == 5u);
+    let y = select(-1.0, 1.0, vi == 2u || vi == 3u || vi == 5u);
+    let local = vec2<f32>(x, y) * extent;
+    return CurveOut(px_to_clip(to_px(center + local)), out_color(color), local,
+        vec4<f32>(radius, scale, mode, 0.0), directions);
+}
+fn cross2(a: vec2<f32>, b: vec2<f32>) -> f32 { return a.x * b.y - a.y * b.x; }
+@fragment
+fn fs_curve(v: CurveOut) -> @location(0) vec4<f32> {
+    let after_start = cross2(v.directions.xy, v.local) >= 0.0;
+    let before_end = cross2(v.local, v.directions.zw) >= 0.0;
+    var distance = abs(length(v.local) - v.shape.x);
+    let on_arc = select(after_start && before_end, after_start || before_end, v.shape.z > 0.5);
+    if (v.shape.z < 1.5 && !on_arc) {
+        distance = min(length(v.local - v.directions.xy * v.shape.x), length(v.local - v.directions.zw * v.shape.x));
+    }
+    let coverage = clamp(1.0 - distance * v.shape.y, 0.0, 1.0);
+    if (coverage <= 0.0) { discard; }
+    return v.color * coverage;
 }
 
 struct GlyphIn {
@@ -847,7 +928,7 @@ impl Resources {
                     multisample: wgpu::MultisampleState { count: 1, mask: !0, alpha_to_coverage_enabled: false },
                     fragment: Some(wgpu::FragmentState {
                         module: &module,
-                        entry_point: Some("fs_main"),
+                        entry_point: Some(if vs == "vs_curve" { "fs_curve" } else { "fs_main" }),
                         targets: &[Some(wgpu::ColorTargetState {
                             format: target.format,
                             blend: (!opaque).then_some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -870,6 +951,19 @@ impl Resources {
                 pipeline("cad_block_fills", "vs_block_line", TriangleList, vertex_layout(), Stencil::Off, false),
                 pipeline("cad_block_lines", "vs_block_line", LineList, vertex_layout(), Stencil::Off, false),
                 pipeline("cad_block_quads", "vs_block_quad", TriangleList, block_quad_layout(), Stencil::Off, false),
+            ],
+            packed_pipeline: [Stencil::Off, Stencil::Off, Stencil::Inside, Stencil::Mask]
+                .into_iter()
+                .enumerate()
+                .flat_map(|(mode, stencil)| {
+                    [wgpu::PrimitiveTopology::TriangleList, wgpu::PrimitiveTopology::LineList]
+                        .into_iter()
+                        .map(move |topology| pipeline("cad_packed", "vs_block_line", topology, packed::layout(), stencil, mode == 1))
+                })
+                .collect(),
+            curve_pipeline: [
+                pipeline("cad_curves", "vs_curve", TriangleList, curves::layout(), Stencil::Off, false),
+                pipeline("cad_clipped_curves", "vs_curve", TriangleList, curves::layout(), Stencil::Inside, false),
             ],
             glyph_pipeline: [
                 pipeline("cad_glyph_fills", "vs_glyph_tri", TriangleList, text::vertex_layout(), Stencil::Off, false),
@@ -900,10 +994,14 @@ impl Resources {
     }
 }
 
-fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage: wgpu::BufferUsages) -> Vec<Batch> {
+fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage: wgpu::BufferUsages, maximum_error: f64) -> Vec<Batch> {
     let mut batches = Vec::new();
-    for chunk in bytes.chunks(CHUNK * stride).filter(|c| c.len() >= stride) {
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents: chunk, usage });
+    let records = if maximum_error > 0.0 && stride == VERTEX_SIZE { 6144 } else { CHUNK };
+    for chunk in bytes.chunks(records * stride).filter(|c| c.len() >= stride) {
+        let encoded = (stride == VERTEX_SIZE).then(|| packed::encode(chunk, maximum_error)).flatten();
+        let packed = encoded.as_ref().map(|e| e.page(device));
+        let contents = encoded.as_ref().map_or(chunk, |e| e.bytes.as_slice());
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage });
         // Small conservative ranges can be rejected before submitting vertices, rather than
         // relying on scissoring. Offsets share one buffer, with no extra GPU allocation.
         for (index, region) in chunk.chunks(384 * stride).enumerate() {
@@ -930,6 +1028,8 @@ fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage
                 placements: None,
                 spatial: culling::Index::new(region, stride).map(Arc::new),
                 glyphs: None,
+                packed: packed.clone(),
+                analytic: false,
             });
         }
     }
@@ -1171,6 +1271,63 @@ impl Resources {
             }
             let Some((normal, batches)) = lanes.get(draw.lane) else { continue };
             let Some(batch) = batches.get(draw.batch) else { continue };
+            if batch.analytic {
+                if !intersects(batch.bounds) {
+                    continue;
+                }
+                let Some(pipeline) = self.curve_pipeline.get(usize::from(callback.stencil == Stencil::Inside)) else { continue };
+                pass.set_pipeline(pipeline);
+                pass.set_vertex_buffer(0, batch.buffer.slice(..));
+                pass.draw(0..6, batch.first + draw.range.start..batch.first + draw.range.end);
+                previous = None;
+                continue;
+            }
+            if let Some(packed) = &batch.packed {
+                if !intersects(batch.bounds) {
+                    continue;
+                }
+                let mode = match callback.stencil {
+                    Stencil::Off => {
+                        if batch.opaque {
+                            1
+                        } else {
+                            0
+                        }
+                    }
+                    Stencil::Inside => 2,
+                    Stencil::Mask => 3,
+                };
+                let Some(pipeline) = self.packed_pipeline.get(mode * 2 + draw.lane) else { continue };
+                pass.set_pipeline(pipeline);
+                pass.set_vertex_buffer(0, batch.buffer.slice(..));
+                pass.set_vertex_buffer(1, packed.transform.slice(..));
+                let mut range = batch.first + draw.range.start..batch.first + draw.range.end;
+                if let (Some(index), Some(view)) = (&batch.spatial, visible)
+                    && !view.contains_box(&batch.bounds)
+                {
+                    for span in index.ranges(&view, draw.range.clone()) {
+                        pass.draw(batch.first + span.start..batch.first + span.end, 0..1);
+                    }
+                } else {
+                    while let Some(next) = draws.peek().filter(|next| next.lane == draw.lane) {
+                        let Some(other) = batches.get(next.batch) else { break };
+                        if other.buffer != batch.buffer
+                            || other.opaque != batch.opaque
+                            || !other.packed.as_ref().is_some_and(|other| Arc::ptr_eq(packed, other))
+                            || range.end != other.first + next.range.start
+                            || !intersects(other.bounds)
+                            || (other.spatial.is_some() && visible.is_some_and(|view| !view.contains_box(&other.bounds)))
+                        {
+                            break;
+                        }
+                        range.end = other.first + next.range.end;
+                        draws.next();
+                    }
+                    pass.draw(range, 0..1);
+                }
+                previous = None;
+                continue;
+            }
             if let Some(glyphs) = &batch.glyphs {
                 if callback.stencil != Stencil::Off {
                     continue;
@@ -1437,6 +1594,8 @@ mod tests {
                 vec![
                     (naga::ShaderStage::Vertex, "vs_line"),
                     (naga::ShaderStage::Vertex, "vs_quad"),
+                    (naga::ShaderStage::Vertex, "vs_curve"),
+                    (naga::ShaderStage::Fragment, "fs_curve"),
                     (naga::ShaderStage::Vertex, "vs_block_line"),
                     (naga::ShaderStage::Vertex, "vs_block_quad"),
                     (naga::ShaderStage::Vertex, "vs_glyph_tri"),

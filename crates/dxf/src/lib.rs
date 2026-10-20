@@ -11,9 +11,15 @@ use std::fmt::Write as _;
 
 mod version;
 pub use version::Version;
+mod stream;
+pub use stream::AsciiReader;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DxfError {
+    #[error("DXF input: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("DXF line exceeds the {limit} byte limit")]
+    LineTooLong { limit: usize },
     #[error("not a DXF file")]
     NotDxf,
     #[error("line {line}: bad group code `{text}`")]

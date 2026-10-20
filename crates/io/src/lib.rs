@@ -12,6 +12,8 @@ mod dxf_read;
 mod dxf_table;
 mod dxf_write;
 mod dxf_xref;
+#[cfg(not(target_arch = "wasm32"))]
+mod import_work;
 pub mod pdf;
 pub mod plotter;
 pub mod svg;
@@ -53,6 +55,12 @@ pub enum IoError {
 
 pub type Result<T> = std::result::Result<T, IoError>;
 
+/// Private temporary storage for streamed DWG imports (Android supplies its writable sandbox).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_import_work_dir(path: std::path::PathBuf) {
+    import_work::set_directory(path);
+}
+
 fn ext(name: &str) -> String {
     std::path::Path::new(name).extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default()
 }
@@ -60,6 +68,15 @@ fn ext(name: &str) -> String {
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
 /// (SVG and gzip-compressed SVGZ).
 pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if bytes.len() >= 4 << 20 {
+        if cadcraft_dwg::is_dwg(bytes) {
+            return import_work::read_dwg(bytes);
+        }
+        if !cadcraft_dxf::is_binary(bytes) && matches!(ext(name).as_str(), "dxf" | "") {
+            return dxf_read::streaming::read(std::io::Cursor::new(bytes), &[]);
+        }
+    }
     if cadcraft_dwg::is_dwg(bytes) {
         let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;
         let mut d = dxf_read::read(&dxf).map_err(|e| IoError::Format(format!("{e} (in the DXF converted from this DWG)")))?;
