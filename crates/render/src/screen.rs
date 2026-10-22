@@ -4,6 +4,7 @@
 //! the full builder; a screen list preserves entity order, including wipeout barriers.
 
 mod blocks;
+mod canonical;
 mod spatial;
 
 type ChunkKey = (usize, usize);
@@ -473,11 +474,25 @@ impl Cache {
             self.context = NEXT_PART.fetch_add(1, Ordering::Relaxed);
         } else if self.options.as_ref().is_some_and(|o| !same_detail(o, &options) || !covers_view(o.view, options.view)) {
             let same = self.options.as_ref().is_some_and(|o| same_detail(o, &options));
-            let stable = if same {
-                self.chunks.iter().filter(|(_, part)| part.view.is_none()).map(|(key, part)| (*key, part.clone())).collect()
-            } else {
-                HashMap::new()
-            };
+            let styles = self.options.as_ref().is_some_and(|o| same_style(o, &options));
+            let stable: HashMap<_, _> = self
+                .chunks
+                .iter()
+                .filter_map(|(key, part)| {
+                    let straight = styles
+                        && part.instances.is_empty()
+                        && part.damage.as_ref().is_some_and(|d| d.entities.iter().all(|e| blocks::straight_entity(drawing, &e.source)));
+                    if part.view.is_some() || !(same || straight) {
+                        return None;
+                    }
+                    let mut part = part.clone();
+                    if !same {
+                        // Reuse exact CPU vertices, but recheck GPU quantization at a new zoom.
+                        part.id = NEXT_PART.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Some((*key, part))
+                })
+                .collect();
             // Preserve clipped hatch/block parts as well as zoom-band variants. Stable chunks
             // are shared by Arc across these entries, without copying their geometry.
             if let (Some(old), Some(source)) = (self.options.take(), self.drawing.clone()) {
@@ -501,7 +516,7 @@ impl Cache {
                 self.templates = v.templates;
                 self.context = v.context;
                 self.options = Some(v.options);
-            } else if same {
+            } else if same || styles {
                 self.chunks = stable;
             } else {
                 self.templates = Default::default();
@@ -536,10 +551,18 @@ impl Cache {
         let missing: Vec<_> = chunks.iter().filter(|(k, _)| !self.chunks.contains_key(k)).collect();
         let make = |&&(key, ents): &&(ChunkKey, &[Arc<Entity>])| {
             let stable_options = Options { view: None, ..options.clone() };
+            let start = key.1.saturating_sub(1) * SPATIAL_CHUNK;
+            let dense = masks
+                .get(&key.0)
+                .and_then(|m| m.get(start..start + ents.len()))
+                .is_none_or(|m| m.iter().filter(|visible| **visible).count() * 4 >= ents.len() * 3);
             // Build complete ordinary chunks only once they touch a visited area. Entirely
             // distant chunks keep the original conservative culling; pressure disables this
             // optional prefetch. Hatches and objects containing blocks stay view dependent.
-            let whole = !self.spatial && self.limit >= 8 << 20 && view_independent(ents) && ents.iter().any(|e| visible(drawing, e, &options));
+            let whole = self.limit >= 8 << 20
+                && view_independent(ents)
+                && (!self.spatial || dense && ents.iter().all(|e| blocks::straight_entity(drawing, e)))
+                && ents.iter().any(|e| visible(drawing, e, &options));
             let build_options = if whole { &stable_options } else { &options };
             let mut b = Builder {
                 list: DisplayList::default(),
@@ -554,7 +577,7 @@ impl Cache {
             };
             let mut damage = Damage { context: self.context, entities: Vec::with_capacity(ents.len()) };
             for (offset, e) in ents.iter().enumerate() {
-                if masks.get(&key.0).and_then(|m| m.get(key.1.saturating_sub(1) * SPATIAL_CHUNK + offset)).is_some_and(|show| !show) {
+                if !whole && masks.get(&key.0).and_then(|m| m.get(key.1.saturating_sub(1) * SPATIAL_CHUNK + offset)).is_some_and(|show| !show) {
                     continue;
                 }
                 let first = b.list.prims.len();
@@ -675,12 +698,12 @@ fn same_options(a: &Options, b: &Options) -> bool {
 fn same_detail(a: &Options, b: &Options) -> bool {
     a.tolerance.to_bits() == b.tolerance.to_bits()
         && a.min_dash.to_bits() == b.min_dash.to_bits()
-        && a.text == b.text
-        && a.fill == b.fill
-        && a.transparency == b.transparency
-        && a.skip_viewport == b.skip_viewport
-        && a.lineweights == b.lineweights
         && a.view_height.to_bits() == b.view_height.to_bits()
+        && same_style(a, b)
+}
+
+fn same_style(a: &Options, b: &Options) -> bool {
+    a.text == b.text && a.fill == b.fill && a.transparency == b.transparency && a.skip_viewport == b.skip_viewport && a.lineweights == b.lineweights
 }
 
 /// Only cull entities with conservative geometric bounds. Text, blocks, wide polylines and

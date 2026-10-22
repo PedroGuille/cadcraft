@@ -4,13 +4,20 @@ use cadcraft_doc::{Drawing, Entity, EntityKind, Insert};
 use cadcraft_geom::{Bounds2, Mat3};
 use std::sync::Arc;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Detail {
+    tolerance: u64,
+    min_dash: u64,
+}
+
 #[derive(Default)]
 pub(super) struct Templates {
-    entries: Vec<(cadcraft_doc::Common, Insert, u64, Arc<DisplayList>)>,
+    entries: Vec<(cadcraft_doc::Common, Insert, Detail, Arc<DisplayList>)>,
     pub bytes: usize,
     limit: usize,
-    eligible: std::collections::HashMap<String, Option<bool>>,
-    weak: Vec<(cadcraft_doc::Common, Insert, u64, std::sync::Weak<DisplayList>)>,
+    eligible: std::collections::HashMap<String, Option<(bool, bool)>>,
+    weak: Vec<(cadcraft_doc::Common, Insert, Detail, std::sync::Weak<DisplayList>)>,
+    canonical: Vec<(u64, std::sync::Weak<DisplayList>)>,
 }
 
 impl Templates {
@@ -18,7 +25,9 @@ impl Templates {
         self.limit = bytes.min(128 << 20);
         while self.bytes > self.limit {
             let Some((_, _, _, list)) = self.entries.pop() else { break };
-            self.bytes = self.bytes.saturating_sub(super::bytes(&list));
+            if !self.entries.iter().any(|(_, _, _, other)| Arc::ptr_eq(&list, other)) {
+                self.bytes = self.bytes.saturating_sub(super::bytes(&list));
+            }
         }
     }
 
@@ -37,9 +46,12 @@ impl Templates {
         local.row_spacing = 0.0;
         let classify = || {
             let mut budget = 4096;
-            eligible(d, &ins.block, 0, &mut budget).then(|| affine_block(d, &ins.block, 0))
+            eligible(d, &ins.block, 0, &mut budget).then(|| {
+                let mut budget = 4096;
+                (affine_block(d, &ins.block, 0), straight_block(d, &ins.block, 0, &mut budget))
+            })
         };
-        let affine_block = if let Some(known) = self.eligible.get(&ins.block) {
+        let (affine_block, straight) = if let Some(known) = self.eligible.get(&ins.block) {
             *known
         } else {
             let known = classify();
@@ -63,7 +75,12 @@ impl Templates {
         let stretch = if affine { ins.scale.x.abs().max(ins.scale.y.abs()).max(1e-12) } else { 1.0 };
         let stretch = 2f64.powf(stretch.log2().ceil());
         let tolerance = options.tolerance / stretch;
-        let band = tolerance.to_bits();
+        // Continuous straight edges do not depend on curve detail or the subpixel dash cutoff.
+        let band = if affine && straight {
+            Detail { tolerance: 0, min_dash: 0 }
+        } else {
+            Detail { tolerance: tolerance.to_bits(), min_dash: (options.min_dash / stretch).to_bits() }
+        };
         if let Some((_, _, _, list)) = self.entries.iter().find(|(common, key, tol, _)| *common == e.common && *key == local && *tol == band) {
             return Some((list.clone(), transform));
         }
@@ -78,11 +95,28 @@ impl Templates {
         let template = Entity { handle: e.handle, common: e.common.clone(), kind: EntityKind::Insert(local.clone()) };
         // Eligible leaves have no view-dependent geometry or draw-order masks.
         let options = Options { tolerance, min_dash: options.min_dash / stretch, view: None, ..options.clone() };
-        let list = Arc::new(crate::build_entities(d, [&template], &options));
+        let built = crate::build_entities(d, [&template], &options);
         if options.cancelled() {
             return None;
         }
-        let bytes = super::bytes(&list);
+        // Compare resolved geometry, not block names or entity handles. A hash is only an
+        // index: exact equality also checks styles and curve hints before sharing storage.
+        let hash = super::canonical::fingerprint(&built);
+        self.canonical.retain(|(_, list)| list.strong_count() > 0);
+        let list = self
+            .canonical
+            .iter()
+            .find_map(|(key, list)| {
+                if *key != hash {
+                    return None;
+                }
+                list.upgrade().filter(|list| super::canonical::equivalent(list, &built))
+            })
+            .unwrap_or_else(|| Arc::new(built));
+        if self.canonical.len() < 256 {
+            self.canonical.push((hash, Arc::downgrade(&list)));
+        }
+        let bytes = if self.entries.iter().any(|(_, _, _, other)| Arc::ptr_eq(&list, other)) { 0 } else { super::bytes(&list) };
         if self.entries.len() < 128 && bytes <= self.limit.saturating_sub(self.bytes) {
             self.bytes = self.bytes.saturating_add(bytes);
             self.entries.push((e.common.clone(), local.clone(), band, list.clone()));
@@ -195,4 +229,50 @@ fn affine_block(d: &Drawing, name: &str, depth: usize) -> bool {
                 _ => true,
             }
     })
+}
+
+fn straight_block(d: &Drawing, name: &str, depth: usize, budget: &mut usize) -> bool {
+    if depth >= cadcraft_doc::MAX_BLOCK_DEPTH {
+        return false;
+    }
+    d.block(name).is_some_and(|block| block.entities.iter().all(|e| straight(d, e, depth + 1, budget)))
+}
+
+/// A conservative subset whose complete screen geometry is independent of zoom detail.
+pub(super) fn straight_entity(d: &Drawing, e: &Entity) -> bool {
+    straight(d, e, 0, &mut 4096)
+}
+
+fn straight(d: &Drawing, e: &Entity, depth: usize, budget: &mut usize) -> bool {
+    let continuous = if depth == 0 {
+        // Ordinary entities know their actual layer. An unrelated dashed layer must not
+        // invalidate every continuous line; nested layer-0 inheritance stays conservative.
+        let lt = e.common.linetype.as_str();
+        let name = if lt.eq_ignore_ascii_case("ByLayer") {
+            d.layer(&e.common.layer).map_or("Continuous", |l| l.linetype.as_str())
+        } else if lt.eq_ignore_ascii_case("ByBlock") {
+            "Continuous"
+        } else {
+            lt
+        };
+        d.linetype(name).is_none_or(|l| l.pattern.is_empty())
+    } else {
+        continuous(d, &e.common)
+    };
+    if *budget == 0 || depth >= cadcraft_doc::MAX_BLOCK_DEPTH || cadcraft_doc::is_annotative(e) || !e.common.xdata.is_empty() || !continuous {
+        return false;
+    }
+    *budget -= 1;
+    match &e.kind {
+        EntityKind::Line(_) => true,
+        EntityKind::LwPolyline(p) => {
+            // Builder::polyline substitutes subpixel runs with more than four points by a
+            // marker. Such runs keep a zoom-dependent identity, even without curved edges.
+            p.vertices.len().saturating_add(usize::from(p.closed)) <= 4
+                && p.const_width == 0.0
+                && p.vertices.iter().all(|v| v.bulge == 0.0 && v.start_width == 0.0 && v.end_width == 0.0)
+        }
+        EntityKind::Insert(i) => single(i) && straight_block(d, &i.block, depth + 1, budget),
+        _ => false,
+    }
 }

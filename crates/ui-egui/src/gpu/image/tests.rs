@@ -310,6 +310,150 @@ fn scene_callback(scene: &cadcraft_render::screen::Scene, cache: &Mutex<blocks::
 }
 
 #[test]
+fn placement_edits_keep_old_snapshots_and_shared_geometry_valid() {
+    use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, Insert, Line, Space};
+    use cadcraft_geom::Vec3;
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    let faults = Arc::new(GpuFaults::default());
+    install(&rs, &faults, None);
+    let mut d = Drawing::new_imperial();
+    let mut block = Block::new("symbol");
+    block.entities.push(Entity::new(Handle(1), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(8.0, 4.0, 0.0) })));
+    d.blocks.insert("symbol".into(), Arc::new(block));
+    let mut handles = Vec::new();
+    for i in 0..256 {
+        handles.push(
+            d.add(
+                &Space::Model,
+                Common::default(),
+                EntityKind::Insert(Insert {
+                    block: "symbol".into(),
+                    insert: Vec3::new(20.0 + f64::from(i % 32) * 30.0, -40.0 - f64::from(i / 32) * 30.0, 0.0),
+                    scale: Vec3::new(1.0, 1.0, 1.0),
+                    rotation: 0.0,
+                    attribs: vec![],
+                    cols: 1,
+                    rows: 1,
+                    col_spacing: 0.0,
+                    row_spacing: 0.0,
+                }),
+            )
+            .unwrap(),
+        );
+    }
+    let mut scenes = cadcraft_render::screen::Cache::default();
+    let templates = Mutex::new(blocks::Cache::default());
+    let options = cadcraft_render::Options::default();
+    let first = scenes.build_scene(&Arc::new(d.clone()), &Space::Model, &options).scene;
+    let upload = |scene: &cadcraft_render::screen::Scene| {
+        let mut mesh = MeshData::default();
+        for part in &scene.parts {
+            mesh.parts.push((part.id, Arc::new(blocks::build_part(part, Vec2::ZERO, Rgb(255, 255, 255), false, &templates))));
+        }
+        Uploaded::new(&rs.device, &rs.queue, &mesh)
+    };
+    let original = upload(&first);
+    let repeat = upload(&first);
+    assert_eq!(original.lines[0].buffer, repeat.lines[0].buffer);
+    assert_eq!(
+        original.lines[0].placements.as_ref().unwrap().buffer,
+        repeat.lines[0].placements.as_ref().unwrap().buffer,
+        "unchanged placements reuse their buffer"
+    );
+    let mut cb = callback(1600, None, [0.0, 0.0]).canvas;
+    cb.slot = Arc::new(Mutex::new(Some(MeshData { uploaded: Some(original.clone()), ..Default::default() })));
+    let before = render(&rs, &cb);
+    d.model.modify(handles[100], |e| {
+        if let EntityKind::Insert(i) = &mut e.kind {
+            i.insert.x += 12.0;
+            i.rotation = 0.5;
+        }
+    });
+    let edited = scenes.build_scene(&Arc::new(d.clone()), &Space::Model, &options).scene;
+    let changed = upload(&edited);
+    assert_eq!(original.lines[0].buffer, changed.lines[0].buffer, "moving a block retains its geometry buffer");
+    assert_ne!(
+        original.lines[0].placements.as_ref().unwrap().buffer,
+        changed.lines[0].placements.as_ref().unwrap().buffer,
+        "the old snapshot remains immutable"
+    );
+    cb.key += 1;
+    cb.slot = Arc::new(Mutex::new(Some(MeshData { uploaded: Some(changed), ..Default::default() })));
+    let actual = render(&rs, &cb);
+    cb.key += 1;
+    cb.slot = Arc::new(Mutex::new(Some(build_mesh(&cadcraft_render::build(&d, &Space::Model, &options), Vec2::ZERO, Rgb(255, 255, 255), false))));
+    same_pixels(&actual, &render(&rs, &cb), "sparse placement update");
+    cb.key += 1;
+    cb.slot = Arc::new(Mutex::new(Some(MeshData { uploaded: Some(original), ..Default::default() })));
+    same_pixels(&before, &render(&rs, &cb), "old placement snapshot after edit");
+    assert_eq!(faults.take(), None);
+}
+
+#[test]
+fn reordered_disjoint_blocks_preserve_transparency_and_overlap_pixels() {
+    use cadcraft_doc::{Block, Common, Drawing, Entity, EntityKind, Insert, Line, Space, Transparency};
+    use cadcraft_geom::Vec3;
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    let faults = Arc::new(GpuFaults::default());
+    install(&rs, &faults, None);
+    for (case, (overlap, transparent, different_inks)) in
+        [(false, false, false), (true, false, false), (false, true, true), (true, true, true), (false, false, true)].into_iter().enumerate()
+    {
+        let mut d = Drawing::new_imperial();
+        for kind in 0..2 {
+            let mut block = Block::new(&format!("symbol{kind}"));
+            let mut line = Entity::new(Handle(1), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(14.0 + f64::from(kind), 10.0, 0.0) }));
+            line.common.color = cadcraft_color::Color::ByBlock;
+            line.common.transparency = Transparency::ByBlock;
+            block.entities.push(line);
+            d.blocks.insert(block.name.clone(), Arc::new(block));
+        }
+        for i in 0..16 {
+            d.add(
+                &Space::Model,
+                Common {
+                    color: cadcraft_color::Color::Index(if different_inks { 1 + i % 2 } else { 1 }),
+                    transparency: Transparency::Percent(if transparent { 40 } else { 0 }),
+                    ..Default::default()
+                },
+                EntityKind::Insert(Insert {
+                    block: format!("symbol{}", i % 2),
+                    insert: Vec3::new(60.0 + if overlap { 0.0 } else { f64::from(i) * 30.0 }, -100.0, 0.0),
+                    scale: Vec3::new(1.0, 1.0, 1.0),
+                    rotation: 0.0,
+                    attribs: vec![],
+                    cols: 1,
+                    rows: 1,
+                    col_spacing: 0.0,
+                    row_spacing: 0.0,
+                }),
+            )
+            .unwrap();
+        }
+        let options = cadcraft_render::Options { transparency: true, ..Default::default() };
+        let scene = cadcraft_render::screen::Cache::default().build_scene(&Arc::new(d.clone()), &Space::Model, &options).scene;
+        let mut mesh = MeshData::default();
+        let cache = Mutex::new(blocks::Cache::default());
+        for part in &scene.parts {
+            mesh.parts.push((part.id, Arc::new(blocks::build_part(part, Vec2::ZERO, Rgb(255, 255, 255), false, &cache))));
+        }
+        let data = Uploaded::new(&rs.device, &rs.queue, &mesh);
+        assert_eq!(data.lines.len(), if overlap || transparent || different_inks { 16 } else { 2 });
+        for (zoom, scale) in [1.0, 0.01].into_iter().enumerate() {
+            let mut cb = callback(1700 + case as u64 * 10 + zoom as u64 * 2, None, [0.0, 0.0]).canvas;
+            cb.scale = scale;
+            cb.slot = Arc::new(Mutex::new(Some(MeshData { uploaded: Some(data.clone()), ..Default::default() })));
+            let actual = render(&rs, &cb);
+            cb.key += 1;
+            cb.slot =
+                Arc::new(Mutex::new(Some(build_mesh(&cadcraft_render::build(&d, &Space::Model, &options), Vec2::ZERO, Rgb(255, 255, 255), false))));
+            same_pixels(&actual, &render(&rs, &cb), "compatible block batching at native and coarse cached zooms");
+        }
+    }
+    assert_eq!(faults.take(), None);
+}
+
+#[test]
 fn editing_one_entity_in_a_scattered_chunk_only_repaints_its_tiles() {
     use cadcraft_doc::{Common, Drawing, EntityKind, Line, Space};
     use cadcraft_geom::Vec3;

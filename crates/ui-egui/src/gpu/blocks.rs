@@ -1,6 +1,9 @@
 //! Shared block vertex buffers with affine per-instance placements (WebGL2/GLES compatible).
 //! Resolved styles are part of the template identity. Instances stay in their original lanes
-//! and wipeout groups; only consecutive equal templates are combined into one instanced draw.
+//! and wipeout groups; disjoint bodies can also join a nearby compatible instanced draw.
+
+mod order;
+mod placements;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -15,11 +18,19 @@ pub struct Cache {
     limit: usize,
     glyphs: text::Cache,
     weak: VecDeque<(std::sync::Weak<DisplayList>, Rgb, bool, std::sync::Weak<Geometry>)>,
+    placements: Arc<Mutex<placements::Cache>>,
 }
 
 impl Default for Cache {
     fn default() -> Self {
-        Self { entries: VecDeque::new(), bytes: 0, limit: 6 << 20, glyphs: text::Cache::default(), weak: VecDeque::new() }
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+            limit: 6 << 20,
+            glyphs: text::Cache::default(),
+            weak: VecDeque::new(),
+            placements: Default::default(),
+        }
     }
 }
 
@@ -126,28 +137,28 @@ pub(super) struct InstanceData {
     geometry: Arc<Geometry>,
     transforms: Vec<u8>,
     bounds: Vec<Bounds2>,
+    handles: Vec<cadcraft_doc::Handle>,
+    updates: Arc<Mutex<placements::Cache>>,
 }
 
 impl InstanceData {
     pub(super) fn bytes(&self) -> usize {
-        self.transforms.capacity().saturating_add(self.bounds.capacity() * std::mem::size_of::<Bounds2>())
+        self.transforms
+            .capacity()
+            .saturating_add(self.bounds.capacity() * std::mem::size_of::<Bounds2>())
+            .saturating_add(self.handles.capacity() * std::mem::size_of::<cadcraft_doc::Handle>())
     }
 
     pub(super) fn upload(&self, device: &wgpu::Device, queue: &wgpu::Queue) -> Uploaded {
         let mut data = self.geometry.upload(device, queue).clone();
-        let placements = Arc::new(Placements {
-            buffer: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("cad_block_placements"),
-                contents: &self.transforms,
-                usage: wgpu::BufferUsages::VERTEX,
-            }),
-            bounds: self.bounds.clone(),
-            _geometry: self.geometry.clone(),
-        });
+        // Snapshots stay immutable: a cancelled worker or an undo scene must never overwrite
+        // placements still used by the visible frame. Sparse edits copy unchanged records on
+        // the GPU and upload only dirty ranges to the new snapshot.
+        let placements = self.updates.lock().unwrap_or_else(std::sync::PoisonError::into_inner).upload(device, queue, self);
         for batch in data.tris.iter_mut().chain(&mut data.lines).chain(&mut data.quads) {
             batch.placements = Some(placements.clone());
         }
-        data.bytes = data.bytes.saturating_add(self.bytes());
+        data.bytes = data.bytes.saturating_add(placements.bytes());
         data
     }
 }
@@ -156,6 +167,17 @@ pub(super) struct Placements {
     _geometry: Arc<Geometry>,
     pub buffer: wgpu::Buffer,
     pub bounds: Vec<Bounds2>,
+    transforms: Arc<[u8]>,
+    handles: Arc<[cadcraft_doc::Handle]>,
+}
+
+impl Placements {
+    fn bytes(&self) -> usize {
+        (self.buffer.size() as usize)
+            .saturating_add(self.transforms.len())
+            .saturating_add(self.bounds.capacity() * std::mem::size_of::<Bounds2>())
+            .saturating_add(std::mem::size_of_val(self.handles.as_ref()))
+    }
 }
 
 /// Convert shared CPU geometry directly to shared GPU buffers. Precision-sensitive or
@@ -177,11 +199,13 @@ pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, c
     let mut pending = DisplayList::default();
     let mut first = 0;
     let mut at = 0;
-    while let Some(instance) = part.instances.get(at) {
+    let order = order::schedule(&part.instances);
+    while let Some(&index) = order.get(at) {
+        let Some(instance) = part.instances.get(index) else { break };
         append_prims(&mut pending, &part.list, part.list.prims.get(first..instance.at).unwrap_or(&[]), cadcraft_geom::Mat3::IDENTITY, None);
         first = instance.at;
         if instance.glyph
-            && let Some((data, count)) = glyphs.as_ref().and_then(|g| g.batch(&part.instances[at..], origin, bg, lw))
+            && let Some((data, count)) = glyphs.as_ref().and_then(|g| g.batch(part.instances.get(index..)?, origin, bg, lw))
         {
             flush(&mut pending, &mut mesh, origin, bg, lw, error);
             mesh.parts.push((0, Arc::new(MeshData { glyphs: Some(data), ..Default::default() })));
@@ -191,7 +215,7 @@ pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, c
         if instance.glyph
             && !part
                 .instances
-                .get(at + 1)
+                .get(index + 1)
                 .is_some_and(|next| Arc::ptr_eq(&next.template, &instance.template) && next.prims.start == instance.prims.end)
         {
             append_instance(&mut pending, instance);
@@ -204,14 +228,17 @@ pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, c
             at += 1;
             continue;
         };
-        let mut data = InstanceData { geometry, transforms: Vec::new(), bounds: Vec::new() };
+        let updates = cache.as_ref().map(|c| c.placements.clone()).unwrap_or_default();
+        let mut data = InstanceData { geometry, transforms: Vec::new(), bounds: Vec::new(), handles: Vec::new(), updates };
         let mut end = at;
-        let mut last = instance.prims.start;
-        while let Some(next) = part.instances.get(end) {
-            if !Arc::ptr_eq(&next.template, &instance.template) || next.prims.start != last || !placement(&mut data, next, origin) {
+        while let Some(next) = order.get(end).and_then(|&i| part.instances.get(i)) {
+            if !Arc::ptr_eq(&next.template, &instance.template)
+                || next.at != instance.at
+                || data.transforms.len() >= 4 << 20
+                || !placement(&mut data, next, origin)
+            {
                 break;
             }
-            last = next.prims.end;
             end += 1;
         }
         // A single glyph is cheaper in the ordinary upload than as an individual draw call.
@@ -286,6 +313,7 @@ fn placement(data: &mut InstanceData, instance: &BlockInstance, origin: Vec2) ->
         data.transforms.extend_from_slice(&value.to_le_bytes());
     }
     data.bounds.push(Bounds2 { min: instance.bounds.min - origin, max: instance.bounds.max - origin });
+    data.handles.push(instance.handle);
     true
 }
 

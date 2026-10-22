@@ -8,7 +8,7 @@ use cadcraft_render::{
 use std::sync::Arc;
 
 fn options(x: f64, tolerance: f64) -> Options {
-    Options { view: Some(Bounds2::new(Vec2::new(x, 0.0), Vec2::new(x + 4.0, 4.0))), tolerance, ..Default::default() }
+    Options { view: Some(Bounds2::new(Vec2::new(x, 0.0), Vec2::new(x + 4.0, 4.0))), tolerance, view_height: tolerance * 1000.0, ..Default::default() }
 }
 
 fn same(scene: &Scene, d: &Drawing, options: &Options) {
@@ -45,13 +45,69 @@ fn ordinary_geometry_survives_many_pans_and_prior_zoom_bands() {
         same(&built.scene, &d, &options(x, 0.1));
     }
     let fine = cache.build_scene(&d, &Space::Model, &options(0.0, 0.01));
-    assert!(fine.rebuilt > 0);
+    assert_eq!(fine.rebuilt, 0, "straight CPU geometry does not need finer tessellation");
+    assert!(Arc::ptr_eq(&fine.scene.parts[0].list, &first.scene.parts[0].list));
+    assert_ne!(fine.scene.parts[0].id, first.scene.parts[0].id, "GPU display precision is rechecked");
     let back = cache.build_scene(&d, &Space::Model, &options(0.0, 0.1));
     assert_eq!(back.rebuilt, 0);
     assert_eq!(back.scene.parts.iter().map(|p| p.id).collect::<Vec<_>>(), ids);
     cache.set_budget(0);
     assert_eq!(cache.bytes(), 0);
     same(&back.scene, &d, &options(0.0, 0.1));
+}
+
+#[test]
+fn spatial_straight_chunks_keep_complete_geometry_across_zoom_and_pan() {
+    let mut d = Drawing::new_imperial();
+    for i in 0..1024 {
+        let x = f64::from(i) * 10.0;
+        d.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::new(x, 0.0, 0.0), b: Vec3::new(x, 2.0, 0.0) })).unwrap();
+    }
+    let d = Arc::new(d);
+    let mut cache = Cache::default();
+    cache.set_spatial_partition(true);
+    cache.set_budget(64 << 20);
+    let area = Some(Bounds2::new(Vec2::new(0.0, 0.0), Vec2::new(1200.0, 4.0)));
+    let first = cache.build_scene(&d, &Space::Model, &Options { view: area, tolerance: 0.1, ..Default::default() }).scene;
+    let fine = cache.build_scene(&d, &Space::Model, &Options { view: area, tolerance: 0.0001, ..Default::default() });
+    assert_eq!(fine.rebuilt, 0);
+    assert!(Arc::ptr_eq(&first.parts[0].list, &fine.scene.parts[0].list));
+    let pan = cache.build_scene(&d, &Space::Model, &options(1000.0, 0.0001));
+    assert_eq!(pan.rebuilt, 0);
+    assert!(pan.scene.flatten().verts.iter().any(|p| p.x == 1000.0), "the complete cached group includes newly visible edges");
+}
+
+#[test]
+fn subpixel_polylines_and_patterned_lines_keep_their_detail_dependent_representation() {
+    use cadcraft_doc::{Linetype, LwPolyline};
+    let mut d = Drawing::new_imperial();
+    d.linetypes.push(Linetype::simple("TEST_DASH", "Synthetic dashes", &[0.1, -0.1]));
+    d.add(
+        &Space::Model,
+        Common::default(),
+        EntityKind::LwPolyline(LwPolyline {
+            vertices: [(0.0, 0.0), (0.01, 0.0), (0.01, 0.01), (0.0, 0.01)].map(|(x, y)| PolyVertex::new(Vec2::new(x, y))).to_vec(),
+            closed: true,
+            const_width: 0.0,
+            elevation: 0.0,
+            plinegen: false,
+        }),
+    )
+    .unwrap();
+    d.add(
+        &Space::Model,
+        Common { linetype: "TEST_DASH".into(), ..Default::default() },
+        EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(2.0, 0.0, 0.0) }),
+    )
+    .unwrap();
+    let d = Arc::new(d);
+    let mut cache = Cache::default();
+    for min_dash in [1.0, 0.00001, 1.0] {
+        let options = Options { min_dash, tolerance: min_dash * 0.25, ..Default::default() };
+        let scene = cache.build_scene(&d, &Space::Model, &options).scene;
+        same(&scene, &d, &options);
+        assert_eq!(scene.flatten().prims, build(&d, &Space::Model, &options).prims);
+    }
 }
 
 #[test]

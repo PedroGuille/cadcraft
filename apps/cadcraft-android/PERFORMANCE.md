@@ -25,8 +25,10 @@ rotations, reflections and unequal scales. Patterned linetypes retain baked line
 to preserve dash lengths. Attribute-bearing references and MINSERT arrays share their fixed body; unique attributes
 remain in their original order and use their own resolved styles. Masks and annotative references
 retain the full builder. Oversized or isolated compatible templates can still share mandatory
-active geometry without charging cold retained caches. Only consecutive compatible
-placements are grouped, and wipeout barriers retain their drawing order. CPU picking, highlights and the software fallback visit shared templates with affine placements;
+active geometry without charging cold retained caches. Compatible placements are grouped when
+consecutive or when conservative bounds prove that nearby intervening bodies with matching
+opaque ink are disjoint.
+Wipeout barriers retain their drawing order. CPU picking, highlights and the software fallback visit shared templates with affine placements;
 only the points actually requested by a consumer are materialized.
 
 Conservative mesh bounds and per-block bounds reject invisible geometry before submitting
@@ -203,3 +205,40 @@ Validation compares streamed and ordinary imports, rendered spatial selection be
 pans/edits, compact GPU buffers and analytic curves, including shader translation for GLES 3.0.
 These changes have not established a device-specific RAM, battery or GPU-time reduction; test
 representative drawings on the target tablet before choosing a cache allowance.
+
+## Straight geometry and placement reuse (Android 0.1.5)
+
+Complete continuous line chunks, including densely visited spatial groups, reuse their exact CPU
+vertices across curve-detail and dash-detail bands. A new upload identity rechecks compact
+GPU display precision at the requested zoom. Straight block bodies without detail-dependent
+markers also retain their CPU and GPU templates across more bands and affine scales. Curved,
+patterned, annotative, wide-polyline and subpixel-marker geometry keeps the detail-dependent
+path; this does not change navigation previews or exported geometry.
+Spatial groups are prefetched only when at least three quarters of their source entities are
+already visible, preserving rejection of scattered, mostly offscreen geometry.
+
+Block definitions with different names can share one resolved screen template when every
+vertex, primitive style, analytic hint and expansion charge matches. Hashes select candidates;
+exact equality verifies them. Entity handles are supplied by each occurrence, and the CAD
+block definitions remain separate. Shared payload is charged once within the template cache.
+
+Placement buffers retain entity order and immutable revision snapshots. Identical placements
+reuse their GPU buffer. For sufficiently large pages with sparse changes, unchanged placement
+records copy on the GPU and only the modified record ranges upload from the CPU. Widespread
+changes, different instance membership and incompatible templates use the complete upload.
+Only weak, bounded lookup entries point to previous pages; live/retained uploaded meshes own
+and account for their buffers, CPU comparison records, handles and bounds. Workers never
+modify a placement buffer used by an older frame or undo snapshot.
+
+A bounded 64-occurrence lookahead can group compatible block placements across intervening
+bodies only when padded conservative bounds prove that they are disjoint and have matching
+uniform opaque ink. The ink guard remains safe when screen-width strokes overlap at a much
+coarser cached zoom or in a transformed preview. Overlaps, uncertain
+bounds, glyph runs and ordinary primitives retain their original ordering boundaries; wipeouts
+remain barriers. Bounds and template stroke extents are calculated once per lookahead window.
+This reduces draw setup in suitable interleaved symbol drawings without sorting the CAD data.
+
+Regression coverage compares zoom reuse, equivalent definitions, original handles/styles,
+sparse movement/rotation, old GPU snapshots, transparent overlaps and grouped rendering with
+the existing complete renderer. Tablet CPU/GPU time and battery gains still require measurement
+on representative drawings and Android hardware.

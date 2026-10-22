@@ -59,6 +59,22 @@ fn relative_sizes_follow_the_view_height() {
 }
 
 #[test]
+fn cached_relative_points_still_follow_the_current_view_height() {
+    let d = std::sync::Arc::new(drawing(2, -5.0));
+    let mut cache = cadcraft_render::screen::Cache::default();
+    for height in [100.0, 20.0, 100.0] {
+        let options = Options { view_height: height, ..Options::default() };
+        let actual = cache.build_scene(&d, &Space::Model, &options).scene.flatten();
+        let expected = build(&d, &Space::Model, &options);
+        assert_eq!(actual.verts, expected.verts);
+        assert_eq!(actual.prims, expected.prims);
+        let (_, lines, bounds) = point_parts(&actual);
+        assert_eq!(lines, 2);
+        assert!((bounds.max.x - bounds.min.x - height * 0.05).abs() < 1e-3);
+    }
+}
+
+#[test]
 fn hostile_point_settings_do_not_panic() {
     for mode in [i64::MIN, -1, 5, 31, 127, i64::MAX] {
         for size in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -1e300, 1e300, 0.0, -5.0] {

@@ -115,6 +115,60 @@ fn selected_shared_geometry_stays_valid_after_optional_caches_are_trimmed() {
 }
 
 #[test]
+fn straight_block_templates_survive_many_detail_levels() {
+    let d = drawing(false, false);
+    let mut cache = Cache::default();
+    cache.set_budget(64 << 20);
+    let first = cache.build_scene(&d, &Space::Model, &Options::default()).scene;
+    let template = first.parts.iter().flat_map(|p| p.instances.iter()).next().unwrap().template.clone();
+    for tolerance in [1.0, 0.00001, 0.1, 0.0000001] {
+        let options = Options { tolerance, min_dash: tolerance * 4.0, view_height: tolerance * 1000.0, ..Default::default() };
+        let scene = cache.build_scene(&d, &Space::Model, &options).scene;
+        assert!(scene.parts.iter().flat_map(|p| p.instances.iter()).all(|i| Arc::ptr_eq(&i.template, &template)));
+        let expected = build(&d, &Space::Model, &options);
+        let actual = scene.flatten();
+        for (a, b) in actual.prims.iter().zip(&expected.prims) {
+            assert_eq!(a.handle, b.handle);
+            for (a, b) in actual.points(a).iter().zip(expected.points(b)) {
+                assert!(a.dist(*b) < 1e-9);
+            }
+        }
+    }
+}
+
+#[test]
+fn equivalent_block_names_share_resolved_geometry_but_keep_handles_and_styles() {
+    let mut d = (*drawing(false, false)).clone();
+    let mut alias = (**d.blocks.get("symbol").unwrap()).clone();
+    alias.name = "equivalent".into();
+    let original = std::mem::take(&mut alias.entities);
+    for e in original.iter() {
+        alias.entities.push(Entity { handle: Handle(e.handle.0 + 1000), ..(**e).clone() });
+    }
+    d.blocks.insert(alias.name.clone(), Arc::new(alias));
+    let mut e = (**d.model.iter().find(|e| matches!(e.kind, EntityKind::Insert(_))).unwrap()).clone();
+    if let EntityKind::Insert(i) = &mut e.kind {
+        i.block = "equivalent".into();
+    }
+    let alias_handle = d.add(&Space::Model, e.common.clone(), e.kind.clone()).unwrap();
+    e.common.color = Color::Index(1);
+    let red_handle = d.add(&Space::Model, e.common, e.kind).unwrap();
+    let scene = Cache::default().build_scene(&Arc::new(d.clone()), &Space::Model, &Options::default()).scene;
+    let copies: Vec<_> = scene.parts.iter().flat_map(|p| p.instances.iter()).collect();
+    let original = copies.first().unwrap();
+    let alias = copies.iter().find(|i| i.handle == alias_handle).unwrap();
+    let red = copies.iter().find(|i| i.handle == red_handle).unwrap();
+    assert!(Arc::ptr_eq(&original.template, &alias.template));
+    assert!(!Arc::ptr_eq(&original.template, &red.template));
+    let full = build(&d, &Space::Model, &Options::default());
+    let actual = scene.flatten();
+    assert_eq!(actual.prims, full.prims);
+    for (a, b) in actual.verts.iter().zip(&full.verts) {
+        assert!(a.dist(*b) < 1e-9);
+    }
+}
+
+#[test]
 fn shared_drafting_glyphs_keep_decorations_transforms_and_distant_detail() {
     let mut d = Drawing::new_imperial();
     for i in 0..24 {
