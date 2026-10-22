@@ -12,6 +12,9 @@ pub(super) fn schedule(instances: &[BlockInstance]) -> Vec<usize> {
     let mut inks = std::collections::HashMap::new();
     let mut at = 0;
     while let Some(base) = order.get(at).and_then(|&i| instances.get(i)) {
+        if cancel::cancelled() {
+            break;
+        }
         if base.glyph {
             at += 1;
             continue;

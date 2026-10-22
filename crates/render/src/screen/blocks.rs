@@ -101,6 +101,19 @@ impl Templates {
         }
         // Compare resolved geometry, not block names or entity handles. A hash is only an
         // index: exact equality also checks styles and curve hints before sharing storage.
+        let list = self.intern(built);
+        let bytes = if self.entries.iter().any(|(_, _, _, other)| Arc::ptr_eq(&list, other)) { 0 } else { super::bytes(&list) };
+        if self.entries.len() < 128 && bytes <= self.limit.saturating_sub(self.bytes) {
+            self.bytes = self.bytes.saturating_add(bytes);
+            self.entries.push((e.common.clone(), local.clone(), band, list.clone()));
+        }
+        if self.weak.len() < 128 {
+            self.weak.push((e.common.clone(), local, band, Arc::downgrade(&list)));
+        }
+        Some((list, transform))
+    }
+
+    pub(super) fn intern(&mut self, built: DisplayList) -> Arc<DisplayList> {
         let hash = super::canonical::fingerprint(&built);
         self.canonical.retain(|(_, list)| list.strong_count() > 0);
         let list = self
@@ -116,15 +129,7 @@ impl Templates {
         if self.canonical.len() < 256 {
             self.canonical.push((hash, Arc::downgrade(&list)));
         }
-        let bytes = if self.entries.iter().any(|(_, _, _, other)| Arc::ptr_eq(&list, other)) { 0 } else { super::bytes(&list) };
-        if self.entries.len() < 128 && bytes <= self.limit.saturating_sub(self.bytes) {
-            self.bytes = self.bytes.saturating_add(bytes);
-            self.entries.push((e.common.clone(), local.clone(), band, list.clone()));
-        }
-        if self.weak.len() < 128 {
-            self.weak.push((e.common.clone(), local, band, Arc::downgrade(&list)));
-        }
-        Some((list, transform))
+        list
     }
 }
 

@@ -24,13 +24,20 @@ use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt;
 
 pub mod blocks;
+mod buffers;
+mod cancel;
 mod culling;
 mod curves;
+mod draw_plan;
 mod image;
 mod packed;
 mod text;
 mod tiles;
 pub use image::CachedCanvasCallback;
+
+pub(crate) fn with_build_cancellation<T>(flag: Option<Arc<std::sync::atomic::AtomicBool>>, run: impl FnOnce() -> T) -> Option<T> {
+    cancel::scope(flag, run)
+}
 
 /// Line/triangle vertex: position (2 × f32, relative to the origin) + sRGB colour (4 × u8,
 /// premultiplied by its alpha: transparent objects blend with what is under them).
@@ -128,6 +135,7 @@ pub struct MeshData {
     uploaded: Option<Uploaded>,
     /// Maximum additional world-space display error allowed for quantized positions.
     pack_error: f64,
+    reuse: Option<buffers::Reuse>,
 }
 
 /// GPU buffers made ahead of the frame that draws them.
@@ -231,6 +239,9 @@ pub fn build_mesh(list: &DisplayList, origin: Vec2, bg: Rgb, lwdisplay: bool) ->
 }
 
 fn build_mesh_prims(list: &DisplayList, prims: &[cadcraft_render::DPrim], origin: Vec2, bg: Rgb, lwdisplay: bool) -> MeshData {
+    if cancel::cancelled() {
+        return MeshData::default();
+    }
     let mut m = MeshData {
         lines: Vec::with_capacity(
             prims
@@ -251,21 +262,31 @@ fn build_mesh_prims(list: &DisplayList, prims: &[cadcraft_render::DPrim], origin
         glyphs: None,
         pack_error: 0.0,
         curves: None,
+        reuse: None,
     };
     for prim in prims {
+        if cancel::cancelled() {
+            return MeshData::default();
+        }
         let col = premultiplied(prim.display_rgb(bg), prim.alpha());
         let pts = list.points(prim);
         match prim.kind {
             Kind::Polyline => match wide_width(prim.lw, lwdisplay) {
                 Some(w) => {
-                    for s in pts.windows(2) {
+                    for (index, s) in pts.windows(2).enumerate() {
+                        if index % 1024 == 0 && cancel::cancelled() {
+                            return MeshData::default();
+                        }
                         if let [a, b] = s {
                             push_instance(&mut m.quads, rel(*a, origin), rel(*b, origin), col, w, 0.0);
                         }
                     }
                 }
                 None => {
-                    for s in pts.windows(2) {
+                    for (index, s) in pts.windows(2).enumerate() {
+                        if index % 1024 == 0 && cancel::cancelled() {
+                            return MeshData::default();
+                        }
                         if let [a, b] = s {
                             push_vertex(&mut m.lines, rel(*a, origin), col);
                             push_vertex(&mut m.lines, rel(*b, origin), col);
@@ -274,7 +295,10 @@ fn build_mesh_prims(list: &DisplayList, prims: &[cadcraft_render::DPrim], origin
                 }
             },
             Kind::Tris => {
-                for t in pts.as_chunks::<3>().0 {
+                for (index, t) in pts.as_chunks::<3>().0.iter().enumerate() {
+                    if index % 1024 == 0 && cancel::cancelled() {
+                        return MeshData::default();
+                    }
                     for q in t {
                         push_vertex(&mut m.tris, rel(*q, origin), col);
                     }
@@ -282,7 +306,10 @@ fn build_mesh_prims(list: &DisplayList, prims: &[cadcraft_render::DPrim], origin
             }
             Kind::Mask => {
                 m.breaks.push([m.tri_vertices(), m.line_vertices(), m.quad_instances()]);
-                for t in pts.as_chunks::<3>().0 {
+                for (index, t) in pts.as_chunks::<3>().0.iter().enumerate() {
+                    if index % 1024 == 0 && cancel::cancelled() {
+                        return MeshData::default();
+                    }
                     for q in t {
                         push_vertex(&mut m.tris, rel(*q, origin), [bg.0, bg.1, bg.2, 255]);
                     }
@@ -447,6 +474,7 @@ struct Batch {
     glyphs: Option<Arc<text::Placements>>,
     packed: Option<Arc<packed::Page>>,
     analytic: bool,
+    version: Option<Arc<buffers::Version>>,
 }
 
 /// One uploaded mesh with its own view uniform (each callback's transform differs).
@@ -454,6 +482,14 @@ struct DrawSpan {
     lane: usize,
     batch: usize,
     range: std::ops::Range<u32>,
+}
+
+fn combined_bounds(bounds: &[Bounds2]) -> Bounds2 {
+    if bounds.iter().any(|b| b.is_empty() || !b.min.is_finite() || !b.max.is_finite()) {
+        Bounds2::EMPTY
+    } else {
+        bounds.iter().fold(Bounds2::EMPTY, |all, b| all.union(b))
+    }
 }
 
 struct Layer {
@@ -468,6 +504,7 @@ struct Layer {
     part_bytes: usize,
     active_parts: std::collections::HashSet<u64>,
     draws: Vec<DrawSpan>,
+    plans: draw_plan::Plans,
 }
 
 impl Uploaded {
@@ -497,9 +534,9 @@ impl Uploaded {
         }
         let usage = wgpu::BufferUsages::VERTEX;
         let mut data = Self {
-            lines: upload(device, "cad_lines", &m.lines, VERTEX_SIZE, usage, maximum_error),
-            tris: upload(device, "cad_fills", &m.tris, VERTEX_SIZE, usage, maximum_error),
-            quads: upload(device, "cad_quads", &m.quads, INSTANCE_SIZE, usage, 0.0),
+            lines: upload(device, queue, "cad_lines", &m.lines, VERTEX_SIZE, usage, maximum_error, m.reuse.as_ref()),
+            tris: upload(device, queue, "cad_fills", &m.tris, VERTEX_SIZE, usage, maximum_error, m.reuse.as_ref()),
+            quads: upload(device, queue, "cad_quads", &m.quads, INSTANCE_SIZE, usage, 0.0, m.reuse.as_ref()),
             breaks: m.breaks.clone(),
             bytes: 0,
         };
@@ -509,6 +546,7 @@ impl Uploaded {
         for batch in data.lines.iter().chain(&data.tris).chain(&data.quads) {
             if buffers.insert(batch.buffer.clone()) {
                 data.bytes = data.bytes.saturating_add(batch.buffer.size() as usize);
+                data.bytes = data.bytes.saturating_add(batch.version.as_ref().map_or(0, |version| version.cpu_bytes()));
             }
             if let Some(page) = &batch.packed
                 && buffers.insert(page.transform.clone())
@@ -609,6 +647,21 @@ impl Layer {
             }
             from = to;
         }
+        let bounds = self
+            .draws
+            .iter()
+            .map(|draw| {
+                let Some(batch) = lanes.get(draw.lane).and_then(|batches| batches.get(draw.batch)) else { return Bounds2::EMPTY };
+                if let Some(placements) = &batch.placements {
+                    combined_bounds(&placements.bounds)
+                } else if let Some(glyphs) = &batch.glyphs {
+                    combined_bounds(&glyphs.bounds)
+                } else {
+                    batch.bounds
+                }
+            })
+            .collect();
+        self.plans.rebuild(bounds);
     }
 }
 
@@ -886,6 +939,7 @@ impl Resources {
                 part_bytes: 0,
                 active_parts: Default::default(),
                 draws: Vec::new(),
+                plans: Default::default(),
             }
         };
         // A render pass with a stencil buffer needs every pipeline to name its format; only the
@@ -994,14 +1048,32 @@ impl Resources {
     }
 }
 
-fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage: wgpu::BufferUsages, maximum_error: f64) -> Vec<Batch> {
+fn upload(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    bytes: &[u8],
+    stride: usize,
+    usage: wgpu::BufferUsages,
+    maximum_error: f64,
+    reuse: Option<&buffers::Reuse>,
+) -> Vec<Batch> {
     let mut batches = Vec::new();
     let records = if maximum_error > 0.0 && stride == VERTEX_SIZE { 6144 } else { CHUNK };
-    for chunk in bytes.chunks(records * stride).filter(|c| c.len() >= stride) {
+    for (page, chunk) in bytes.chunks(records * stride).filter(|c| c.len() >= stride).enumerate() {
         let encoded = (stride == VERTEX_SIZE).then(|| packed::encode(chunk, maximum_error)).flatten();
         let packed = encoded.as_ref().map(|e| e.page(device));
         let contents = encoded.as_ref().map_or(chunk, |e| e.bytes.as_slice());
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage });
+        let version = reuse.filter(|_| contents.len() <= 8 << 20).and_then(|reuse| {
+            use std::hash::{Hash, Hasher};
+            let mut key = std::collections::hash_map::DefaultHasher::new();
+            (reuse.key, label, page, encoded.is_some()).hash(&mut key);
+            reuse.cache.lock().ok().map(|mut cache| cache.upload(device, queue, key.finish(), label, contents, usage))
+        });
+        let buffer = version
+            .as_ref()
+            .map(|version| version.buffer.clone())
+            .unwrap_or_else(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some(label), contents, usage }));
         // Small conservative ranges can be rejected before submitting vertices, rather than
         // relying on scissoring. Offsets share one buffer, with no extra GPU allocation.
         for (index, region) in chunk.chunks(384 * stride).enumerate() {
@@ -1030,6 +1102,7 @@ fn upload(device: &wgpu::Device, label: &str, bytes: &[u8], stride: usize, usage
                 glyphs: None,
                 packed: packed.clone(),
                 analytic: false,
+                version: version.clone(),
             });
         }
     }
@@ -1119,7 +1192,7 @@ pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Op
 
 impl Layer {
     fn retained_bytes(&self) -> usize {
-        self.parts.iter().filter(|(id, _)| !self.active_parts.contains(id)).map(|(_, p)| p.bytes).sum()
+        self.parts.iter().filter(|(id, _)| !self.active_parts.contains(id)).map(|(_, p)| p.bytes).sum::<usize>().saturating_add(self.plans.bytes())
     }
 }
 
@@ -1129,6 +1202,12 @@ impl Resources {
         let limit = self.cache_limit.saturating_sub(self.image.as_ref().map_or(0, image::SceneImage::bytes));
         while bytes > limit {
             let Some(layer) = self.layers.iter_mut().max_by_key(|l| l.retained_bytes()) else { break };
+            let plans = layer.plans.bytes();
+            if plans != 0 {
+                layer.plans.clear();
+                bytes = bytes.saturating_sub(plans);
+                continue;
+            }
             let Some(at) = layer.parts.iter().position(|(id, _)| !layer.active_parts.contains(id)) else { break };
             let Some((_, old)) = layer.parts.remove(at) else { break };
             layer.part_bytes = layer.part_bytes.saturating_sub(old.bytes);
@@ -1141,6 +1220,10 @@ impl Resources {
 pub fn set_cache_budget(rs: &egui_wgpu::RenderState, mib: u32) {
     if let Some(resources) = rs.renderer.write().callback_resources.get_mut::<Resources>() {
         resources.cache_limit = (mib.min(2048) as usize) << 20;
+        let plan_budget = resources.cache_limit / 64 / resources.layers.len().max(1);
+        for layer in &resources.layers {
+            layer.plans.set_budget(plan_budget);
+        }
         if let Some(image) = resources.image.as_mut() {
             image.trim_history(resources.cache_limit / 2, 0);
         }
@@ -1161,6 +1244,7 @@ pub fn trim_cache(rs: &egui_wgpu::RenderState) {
             layer.quads.clear();
             layer.breaks.clear();
             layer.draws.clear();
+            layer.plans.rebuild(Vec::new());
             layer.parts.clear();
             layer.active_parts.clear();
             layer.part_bytes = 0;
@@ -1264,7 +1348,8 @@ impl Resources {
         let visible = callback.visible(clip);
         let intersects = |bounds: Bounds2| bounds.is_empty() || visible.is_none_or(|view| bounds.intersects(&view));
         let mut previous = None;
-        let mut draws = res.draws.iter().peekable();
+        let planned = res.plans.query(visible);
+        let mut draws = planned.iter().filter_map(|&id| res.draws.get(id)).peekable();
         while let Some(draw) = draws.next() {
             if mask && draw.lane != 0 {
                 continue;
@@ -1337,16 +1422,9 @@ impl Resources {
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(1, bind, &[]);
                 pass.set_vertex_buffer(0, batch.buffer.slice(..));
-                let mut first = None;
-                for (index, bounds) in glyphs.bounds.iter().enumerate().chain(std::iter::once((glyphs.bounds.len(), &Bounds2::EMPTY))) {
-                    let show = index < glyphs.bounds.len() && intersects(*bounds);
-                    if show && first.is_none() {
-                        first = Some(index as u32);
-                    }
-                    if !show && let Some(start) = first.take() {
-                        let vertices = if draw.lane == 2 { draw.range.start * 6..draw.range.end * 6 } else { draw.range.clone() };
-                        pass.draw(vertices, start..index as u32);
-                    }
+                for instances in culling::placements::ranges(&glyphs.bounds, glyphs.spatial.as_ref(), visible) {
+                    let vertices = if draw.lane == 2 { draw.range.start * 6..draw.range.end * 6 } else { draw.range.clone() };
+                    pass.draw(vertices, instances);
                 }
                 previous = None;
                 continue;
@@ -1410,16 +1488,9 @@ impl Resources {
             }
             if let Some(placements) = &batch.placements {
                 pass.set_vertex_buffer(1, placements.buffer.slice(..));
-                let mut first = None;
-                for (index, bounds) in placements.bounds.iter().enumerate().chain(std::iter::once((placements.bounds.len(), &Bounds2::EMPTY))) {
-                    let show = index < placements.bounds.len() && intersects(*bounds);
-                    if show && first.is_none() {
-                        first = Some(index as u32);
-                    }
-                    if !show && let Some(start) = first.take() {
-                        let vertices = if draw.lane == 2 { range.start * 6..range.end * 6 } else { range.clone() };
-                        pass.draw(vertices, start..index as u32);
-                    }
+                for instances in culling::placements::ranges(&placements.bounds, placements.spatial.as_ref(), visible) {
+                    let vertices = if draw.lane == 2 { range.start * 6..range.end * 6 } else { range.clone() };
+                    pass.draw(vertices, instances);
                 }
             } else if draw.lane == 2 {
                 pass.draw(0..6, range);

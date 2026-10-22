@@ -242,3 +242,53 @@ Regression coverage compares zoom reuse, equivalent definitions, original handle
 sparse movement/rotation, old GPU snapshots, transparent overlaps and grouped rendering with
 the existing complete renderer. Tablet CPU/GPU time and battery gains still require measurement
 on representative drawings and Android hardware.
+
+## Spatial operation plans and persistent geometry (Android 0.1.6)
+
+Block and glyph placements have a bounded spatial hierarchy over their immutable bounds.
+Queries reject complete offscreen branches, then return exact visible ranges in original order.
+Unknown bounds remain visible. Ordinary geometry keeps its existing range hierarchy. Uploaded
+operation lists also have a spatial directory; up to 64 tile/view plans retain only applicable
+operations. Uploads invalidate the plans, and view, clipping and transform changes use different
+world-space queries. Wipeout and transparency ordering stays intact. Plan retention shares the
+GPU allowance and releases under pressure.
+
+Independent four-corner polyline outlines can share one unit rectangle with affine placements.
+This applies only after the normal builder has resolved styles and detail, and only when every
+rendered f64 coordinate is reproduced exactly. Tiny markers, fills, dashed fragments and other
+incompatible geometry retain their original paths. Original CAD entities, handles and exports
+are unchanged.
+
+An ordinary entity's tessellation can survive an edit to its neighbours in the same COW chunk.
+Weak source identities and exact detail settings guard a bounded 16 MiB cache within the CPU
+allowance. Ordinary mesh pages can reuse immutable GPU buffers or copy an old page and upload
+only changed four-byte-aligned ranges. Sparse copying needs at least 4 KiB, at most 64 changed
+ranges and at most one quarter changed bytes. Reordered or resized data can use full uploads.
+Packed pages retain their own newly validated transforms. Comparison records share a separate
+bounded slice of the existing block allowance, capped at 16 MiB, and can be discarded while
+active GPU buffers remain valid. Old frames and undo snapshots are never overwritten.
+
+The regeneration worker checks cancellation while converting large primitive/vertex arrays,
+grouping placements and preparing text pages. Superseded work is discarded before upload;
+complete geometry shared by other frames remains valid. GPU API calls already submitted are
+allowed to finish. The existing single worker still keeps only the latest pending request.
+
+Android enables a disposable geometry directory on internal app storage. Compatible continuous,
+non-annotative ordinary entities retain processed f64 geometry and curve hints across sessions.
+An index locates records without loading the full cache. Exact serialized entity and effective
+detail keys verify hash candidates; drawing headers, layers, linetypes and hidden-object state
+identify the rendering context. A renderer-source/dependency fingerprint invalidates old builds.
+Blocks, text, patterned geometry and other unsupported cases use the normal builders.
+
+Each disk context is limited to 32 MiB and 16,384 entries, and at most 16 context files are kept
+(512 MiB). An entry has at most 64 KiB of key data and 256 KiB of geometry. File locks keep
+writers apart; locked files are not pruned. Checksums, bounded lengths and primitive validation
+make truncated, corrupted and incompatible entries rebuild normally. Source files and recovery
+snapshots are never used as cache storage. Memory pressure can close the disk index and release
+its buffers. Opening still parses the original drawing and uploads GPU resources; this is a
+processed geometry cache, not a replacement document format or a direct DWG reader.
+
+Regression checks cover exact shared rectangle coordinates, neighbour edits/undo, spatial
+visibility against linear queries, tile-plan invalidation, sparse GPU copies, cache trimming,
+disk round trips and damaged-cache fallback. Gains in frame time, battery use and reopening
+time still require measurements on an Android tablet with representative drawings.

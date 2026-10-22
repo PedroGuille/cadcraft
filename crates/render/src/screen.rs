@@ -5,6 +5,10 @@
 
 mod blocks;
 mod canonical;
+#[cfg(not(target_arch = "wasm32"))]
+mod disk;
+mod entities;
+mod shapes;
 mod spatial;
 
 type ChunkKey = (usize, usize);
@@ -22,6 +26,12 @@ use crate::{Builder, DisplayList, MAX_BLOCK_EXPANSION, Options, entity, top_ctx}
 // Additional geometry retained for reuse, apart from the list needed to draw the scene.
 const MAX_BYTES: usize = 32 << 20;
 static NEXT_PART: AtomicU64 = AtomicU64::new(1);
+
+/// Enable bounded disposable geometry on a native host's private internal storage.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_disk_cache_directory(path: std::path::PathBuf) {
+    disk::set_directory(path);
+}
 
 /// Font preferences are part of the canvas and text geometry cache keys.
 pub fn font_revision() -> u64 {
@@ -304,6 +314,7 @@ pub struct Cache {
     views: VecDeque<Variant>,
     spatial: bool,
     spatial_index: spatial::Cache,
+    entities: Arc<std::sync::Mutex<entities::Cache>>,
 }
 
 #[derive(Clone)]
@@ -335,6 +346,7 @@ impl Default for Cache {
             views: VecDeque::new(),
             spatial: false,
             spatial_index: Default::default(),
+            entities: Default::default(),
         }
     }
 }
@@ -378,11 +390,15 @@ impl Cache {
             .saturating_add(templates)
             .saturating_add(self.views.iter().fold(0usize, |n, v| n.saturating_add(v.bytes())))
             .saturating_add(self.spatial_index.bytes())
+            .saturating_add(self.entities.try_lock().map_or(0, |cache| cache.retained()))
     }
 
     /// Retain as many individual chunks as fit; the active drawing is never truncated.
     pub fn set_budget(&mut self, bytes: usize) {
         self.limit = bytes;
+        if let Ok(mut entities) = self.entities.try_lock() {
+            entities.set_budget(bytes / 8);
+        }
         self.spatial_index.trim(bytes / 8);
         while !self.views.is_empty() && self.bytes() > bytes {
             self.views.pop_front();
@@ -404,6 +420,7 @@ impl Cache {
                 0
             })
             .saturating_add(history)
+            .saturating_add(self.entities.try_lock().map_or(0, |cache| cache.retained()))
             .saturating_add(self.spatial_index.bytes());
         self.chunks.retain(|_, part| {
             let size = part.bytes();
@@ -471,6 +488,11 @@ impl Cache {
             self.chunks.clear();
             self.active.clear();
             self.templates = Default::default();
+            self.entities = Default::default();
+            if let Ok(mut entities) = self.entities.lock() {
+                entities.set_budget(self.limit / 8);
+                entities.configure_disk(drawing);
+            }
             self.context = NEXT_PART.fetch_add(1, Ordering::Relaxed);
         } else if self.options.as_ref().is_some_and(|o| !same_detail(o, &options) || !covers_view(o.view, options.view)) {
             let same = self.options.as_ref().is_some_and(|o| same_detail(o, &options));
@@ -529,6 +551,9 @@ impl Cache {
         if let Ok(mut templates) = self.templates.lock() {
             templates.set_budget(self.limit / 4);
         }
+        if let Ok(mut entities) = self.entities.lock() {
+            entities.set_budget(self.limit / 8);
+        }
         for (&key, (id, weak, instances, damage, view)) in &self.active {
             if let Some(list) = weak.upgrade() {
                 self.chunks.entry(key).or_insert_with(|| Part {
@@ -577,13 +602,31 @@ impl Cache {
             };
             let mut damage = Damage { context: self.context, entities: Vec::with_capacity(ents.len()) };
             for (offset, e) in ents.iter().enumerate() {
+                if options.cancelled() {
+                    break;
+                }
                 if !whole && masks.get(&key.0).and_then(|m| m.get(key.1.saturating_sub(1) * SPATIAL_CHUNK + offset)).is_some_and(|show| !show) {
                     continue;
                 }
                 let first = b.list.prims.len();
                 let instance = b.instances.len();
                 if visible(drawing, e, build_options) && !blocks::draw(&self.templates, &mut b, drawing, e) {
-                    entity(&mut b, &top_ctx(drawing, Mat3::IDENTITY, e.handle, &[], &[]), e);
+                    let reusable = entities::eligible(e);
+                    let cached = reusable.then(|| self.entities.lock().ok().and_then(|mut cache| cache.get(e, build_options, drawing))).flatten();
+                    if let Some(cached) = cached {
+                        entities::append(&mut b.list, &cached);
+                    } else {
+                        entity(&mut b, &top_ctx(drawing, Mat3::IDENTITY, e.handle, &[], &[]), e);
+                        if reusable && b.instances.len() == instance && !options.cancelled() {
+                            shapes::share(&mut b, e, first, &self.templates);
+                            if b.instances.len() == instance
+                                && let Some(list) = entities::slice(&b.list, first)
+                                && let Ok(mut cache) = self.entities.lock()
+                            {
+                                cache.insert(e, build_options, list, drawing);
+                            }
+                        }
+                    }
                 }
                 let mut bounds = cadcraft_geom::Bounds2::EMPTY;
                 let mut finite = true;
@@ -643,6 +686,10 @@ impl Cache {
             .map_or(0, |c| c.bytes)
             .saturating_add(self.views.iter().fold(0usize, |n, v| n.saturating_add(v.bytes())))
             .saturating_add(self.spatial_index.bytes());
+        if let Ok(mut cache) = self.entities.lock() {
+            cache.flush();
+        }
+        retained = retained.saturating_add(self.entities.try_lock().map_or(0, |cache| cache.retained()));
         self.active.clear();
         for (key, _) in chunks {
             let Some(part) = made.remove(&key).or_else(|| self.chunks.remove(&key)) else { return fallback(self) };

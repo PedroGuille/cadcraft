@@ -134,15 +134,20 @@ fn run(mut req: Request) -> Option<Built> {
                 }
                 let id = super::part_mesh_key(part.id, origin, bg, m.lwdisplay);
                 let mesh = m.parts.get(&id).cloned().unwrap_or_else(|| {
-                    let mut mesh = crate::gpu::blocks::build_part_with_precision(
-                        part,
-                        origin,
-                        bg,
-                        m.lwdisplay,
-                        &m.blocks,
-                        if m.compact { req.opts.tolerance.abs() * 0.125 } else { 0.0 },
-                    );
-                    if let (Some(device), Some(queue)) = (&m.device, &m.queue) {
+                    let built = crate::gpu::with_build_cancellation(req.opts.cancel.clone(), || {
+                        crate::gpu::blocks::build_part_with_precision(
+                            part,
+                            origin,
+                            bg,
+                            m.lwdisplay,
+                            &m.blocks,
+                            if m.compact { req.opts.tolerance.abs() * 0.125 } else { 0.0 },
+                        )
+                    });
+                    let mut mesh = built.unwrap_or_default();
+                    if !req.opts.cancelled()
+                        && let (Some(device), Some(queue)) = (&m.device, &m.queue)
+                    {
                         mesh.upload_now(device, queue);
                     }
                     Arc::new(mesh)

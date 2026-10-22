@@ -123,6 +123,9 @@ impl Cache {
         self.entries.retain(|_, (_, page, _)| page.strong_count() > 0);
         let mut counts = HashMap::<usize, usize>::new();
         for i in instances.iter().filter(|i| i.glyph) {
+            if cancel::cancelled() {
+                return Prepared(HashMap::new());
+            }
             let key = Arc::as_ptr(&i.template) as usize;
             if counts.len() < 1024 || counts.contains_key(&key) {
                 let n = counts.entry(key).or_default();
@@ -186,6 +189,9 @@ impl Cache {
         };
         let mut seen = std::collections::HashSet::new();
         for instance in instances.iter().filter(|i| i.glyph) {
+            if cancel::cancelled() {
+                return Prepared(prepared);
+            }
             let source = &instance.template;
             let key = Arc::as_ptr(source) as usize;
             if seen.len() >= 1024 || !seen.insert(key) {
@@ -327,6 +333,7 @@ impl Prepared {
 pub(super) struct Placements {
     page: Arc<Page>,
     pub bounds: Vec<Bounds2>,
+    pub spatial: Option<culling::placements::Index>,
 }
 
 impl Placements {
@@ -357,6 +364,8 @@ impl InstanceData {
             breaks: Vec::new(),
             bytes: self.bytes().saturating_add(self.page.retained),
         };
+        let spatial = culling::placements::Index::new(&self.bounds);
+        uploaded.bytes = uploaded.bytes.saturating_add(spatial.as_ref().map_or(0, culling::placements::Index::bytes));
         let batch = Batch {
             buffer,
             count: self.records * if self.lane == 1 { 2 } else { 1 },
@@ -367,7 +376,8 @@ impl InstanceData {
             spatial: None,
             packed: None,
             analytic: false,
-            glyphs: Some(Arc::new(Placements { page: self.page.clone(), bounds: self.bounds.clone() })),
+            version: None,
+            glyphs: Some(Arc::new(Placements { page: self.page.clone(), bounds: self.bounds.clone(), spatial })),
         };
         match self.lane {
             0 => uploaded.tris.push(batch),

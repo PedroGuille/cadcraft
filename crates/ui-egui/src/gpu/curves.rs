@@ -36,6 +36,7 @@ impl Data {
                 glyphs: None,
                 packed: None,
                 analytic: true,
+                version: None,
             });
         }
         Uploaded { lines, tris: Vec::new(), quads: Vec::new(), breaks: Vec::new(), bytes: self.records.len() }
@@ -84,6 +85,9 @@ pub(super) fn build(list: &DisplayList, origin: Vec2, bg: Rgb, lw: bool, error: 
     let mut first = 0;
     let mut at = 0;
     while let Some(hint) = list.analytic.get(at) {
+        if cancel::cancelled() {
+            return MeshData::default();
+        }
         let mut data = Data { records: Vec::new(), bounds: Vec::new() };
         let mut end = at;
         let mut next = hint.prim;

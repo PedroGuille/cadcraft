@@ -600,6 +600,7 @@ dependencies = [
  "android_logger",
  "cadcraft-engine",
  "cadcraft-io",
+ "cadcraft-render",
  "cadcraft-ui-egui",
  "eframe",
  "egui",
@@ -742,6 +743,7 @@ dependencies = [
  "cadcraft-geom",
  "lyon_tessellation",
  "rayon",
+ "serde",
  "serde_json",
  "tiny-skia",
 ]

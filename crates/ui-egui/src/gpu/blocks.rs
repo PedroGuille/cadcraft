@@ -19,6 +19,7 @@ pub struct Cache {
     glyphs: text::Cache,
     weak: VecDeque<(std::sync::Weak<DisplayList>, Rgb, bool, std::sync::Weak<Geometry>)>,
     placements: Arc<Mutex<placements::Cache>>,
+    buffers: Arc<Mutex<buffers::Cache>>,
 }
 
 impl Default for Cache {
@@ -30,6 +31,7 @@ impl Default for Cache {
             glyphs: text::Cache::default(),
             weak: VecDeque::new(),
             placements: Default::default(),
+            buffers: Default::default(),
         }
     }
 }
@@ -37,6 +39,9 @@ impl Default for Cache {
 impl Cache {
     pub fn set_budget(&mut self, bytes: usize) {
         let bytes = bytes.min(256 << 20);
+        if let Ok(mut buffers) = self.buffers.try_lock() {
+            buffers.set_budget(bytes / 4);
+        }
         self.glyphs.set_budget(bytes / 3);
         self.limit = bytes - bytes / 3;
         while self.bytes > self.limit {
@@ -79,8 +84,14 @@ impl Cache {
             return None;
         }
         let quads = std::mem::take(&mut mesh.quads);
+        if cancel::cancelled() {
+            return None;
+        }
         mesh.quads.reserve(quad_bytes);
-        for segment in quads.as_chunks::<INSTANCE_SIZE>().0 {
+        for (index, segment) in quads.as_chunks::<INSTANCE_SIZE>().0.iter().enumerate() {
+            if index % 1024 == 0 && cancel::cancelled() {
+                return None;
+            }
             for _ in 0..6 {
                 mesh.quads.extend_from_slice(segment);
             }
@@ -169,6 +180,7 @@ pub(super) struct Placements {
     pub bounds: Vec<Bounds2>,
     transforms: Arc<[u8]>,
     handles: Arc<[cadcraft_doc::Handle]>,
+    pub spatial: Option<culling::placements::Index>,
 }
 
 impl Placements {
@@ -177,6 +189,7 @@ impl Placements {
             .saturating_add(self.transforms.len())
             .saturating_add(self.bounds.capacity() * std::mem::size_of::<Bounds2>())
             .saturating_add(std::mem::size_of_val(self.handles.as_ref()))
+            .saturating_add(self.spatial.as_ref().map_or(0, culling::placements::Index::bytes))
     }
 }
 
@@ -188,9 +201,15 @@ pub fn build_part(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Ca
 
 /// Tablet upload with a bounded additional display error; exact CPU geometry stays intact.
 pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: &Mutex<Cache>, error: f64) -> MeshData {
+    if cancel::cancelled() {
+        return MeshData::default();
+    }
     if part.instances.is_empty() {
         let mut mesh = curves::build(&part.list, origin, bg, lw, error);
         mesh.set_display_precision(error);
+        if let Ok(cache) = cache.try_lock() {
+            reuse_ordinary(&mut mesh, part, origin, bg, lw, cache.buffers.clone());
+        }
         return mesh;
     }
     let mut cache = cache.try_lock().ok();
@@ -201,6 +220,9 @@ pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, c
     let mut at = 0;
     let order = order::schedule(&part.instances);
     while let Some(&index) = order.get(at) {
+        if cancel::cancelled() {
+            return MeshData::default();
+        }
         let Some(instance) = part.instances.get(index) else { break };
         append_prims(&mut pending, &part.list, part.list.prims.get(first..instance.at).unwrap_or(&[]), cadcraft_geom::Mat3::IDENTITY, None);
         first = instance.at;
@@ -232,6 +254,9 @@ pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, c
         let mut data = InstanceData { geometry, transforms: Vec::new(), bounds: Vec::new(), handles: Vec::new(), updates };
         let mut end = at;
         while let Some(next) = order.get(end).and_then(|&i| part.instances.get(i)) {
+            if cancel::cancelled() {
+                return MeshData::default();
+            }
             if !Arc::ptr_eq(&next.template, &instance.template)
                 || next.at != instance.at
                 || data.transforms.len() >= 4 << 20
@@ -255,7 +280,37 @@ pub fn build_part_with_precision(part: &Part, origin: Vec2, bg: Rgb, lw: bool, c
     append_prims(&mut pending, &part.list, part.list.prims.get(first..).unwrap_or(&[]), cadcraft_geom::Mat3::IDENTITY, None);
     flush(&mut pending, &mut mesh, origin, bg, lw, error);
     mesh.set_display_precision(error);
+    if let Some(cache) = &cache {
+        reuse_ordinary(&mut mesh, part, origin, bg, lw, cache.buffers.clone());
+    }
     mesh
+}
+
+fn reuse_ordinary(mesh: &mut MeshData, part: &Part, origin: Vec2, bg: Rgb, lw: bool, cache: Arc<Mutex<buffers::Cache>>) {
+    use std::hash::{Hash, Hasher};
+    let Some(damage) = &part.damage else { return };
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    (
+        damage.entities.first().map(|e| e.source.handle),
+        damage.entities.last().map(|e| e.source.handle),
+        damage.entities.len(),
+        origin.x.to_bits(),
+        origin.y.to_bits(),
+        bg.0,
+        bg.1,
+        bg.2,
+        lw,
+    )
+        .hash(&mut key);
+    fn assign(mesh: &mut MeshData, key: u64, cache: &Arc<Mutex<buffers::Cache>>) {
+        mesh.reuse = Some(buffers::Reuse { key, cache: cache.clone() });
+        for (index, (_, part)) in mesh.parts.iter_mut().enumerate() {
+            if let Some(part) = Arc::get_mut(part) {
+                assign(part, key.wrapping_mul(6364136223846793005).wrapping_add(index as u64), cache);
+            }
+        }
+    }
+    assign(mesh, key.finish(), &cache);
 }
 
 fn append_instance(dst: &mut DisplayList, instance: &BlockInstance) {
@@ -270,11 +325,19 @@ fn append_prims(
     handle: Option<cadcraft_doc::Handle>,
 ) {
     for source in prims {
+        if cancel::cancelled() {
+            return;
+        }
         let mut p = *source;
         let target = if matches!(p.kind, Kind::Tris | Kind::Mask) { &mut dst.tris } else { &mut dst.verts };
         p.start = target.len() as u32;
         p.handle = handle.unwrap_or(p.handle);
-        target.extend(src.points(source).iter().map(|p| xf.apply(*p)));
+        for points in src.points(source).chunks(1024) {
+            if cancel::cancelled() {
+                return;
+            }
+            target.extend(points.iter().map(|p| xf.apply(*p)));
+        }
         if xf == cadcraft_geom::Mat3::IDENTITY {
             // Hints carry a primitive index, but source slices may start in the middle.
             if let Some(hint) = src

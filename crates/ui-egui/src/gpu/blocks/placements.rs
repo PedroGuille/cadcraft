@@ -53,6 +53,7 @@ impl Cache {
             _geometry: data.geometry.clone(),
             transforms: data.transforms.clone().into(),
             handles: data.handles.clone().into(),
+            spatial: culling::placements::Index::new(&data.bounds),
         });
         while self.pages.len() >= 128 {
             self.pages.pop_front();

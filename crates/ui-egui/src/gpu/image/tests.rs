@@ -6,6 +6,56 @@ use egui_wgpu::{CallbackTrait, ScreenDescriptor};
 
 const SIZE: [u32; 2] = [1536, 1024];
 
+#[test]
+fn ordinary_rectangle_instances_match_direct_pixels_across_views_and_pressure() {
+    use cadcraft_doc::{Common, Drawing, EntityKind, LwPolyline, Space};
+    use cadcraft_geom::PolyVertex;
+    let mut drawing = Drawing::new_imperial();
+    for i in 0..160 {
+        let x = f64::from(i % 20) * 40.0;
+        let y = -f64::from(i / 20) * 40.0 - 20.0;
+        let width = f64::from(i % 4 + 1) * 4.0;
+        drawing
+            .add(
+                &Space::Model,
+                Common { color: cadcraft_color::Color::Index((i % 3 + 1) as u8), ..Default::default() },
+                EntityKind::LwPolyline(LwPolyline {
+                    vertices: [(x, y), (x + width, y), (x + width, y + 8.0), (x, y + 8.0)].map(|(x, y)| PolyVertex::new(Vec2::new(x, y))).to_vec(),
+                    closed: true,
+                    const_width: 0.0,
+                    elevation: 0.0,
+                    plinegen: false,
+                }),
+            )
+            .unwrap();
+    }
+    let drawing = Arc::new(drawing);
+    let options = cadcraft_render::Options::default();
+    let scene = cadcraft_render::screen::Cache::default().build_scene(&drawing, &Space::Model, &options).scene;
+    let full = cadcraft_render::build(&drawing, &Space::Model, &options);
+    let rs = egui_kittest::wgpu::create_render_state(egui_kittest::wgpu::default_wgpu_setup(), Default::default());
+    let faults = Arc::new(GpuFaults::default());
+    install(&rs, &faults, None);
+    set_cache_budget(&rs, 0);
+    let cache = Mutex::new(blocks::Cache::default());
+    cache.lock().unwrap().set_budget(0);
+    for (index, scale) in [1.0, 0.25, 3.0].into_iter().enumerate() {
+        let mut mesh = MeshData::default();
+        for part in &scene.parts {
+            mesh.parts.push((part.id, Arc::new(blocks::build_part(part, Vec2::ZERO, Rgb(255, 255, 255), false, &cache))));
+        }
+        let mut shared = callback(900 + index as u64 * 2, None, [-20.0, 11.0]).canvas;
+        shared.scale = scale;
+        shared.slot = Arc::new(Mutex::new(Some(mesh)));
+        let pixels = render(&rs, &shared);
+        let mut direct = callback(901 + index as u64 * 2, None, [-20.0, 11.0]).canvas;
+        direct.scale = scale;
+        direct.slot = Arc::new(Mutex::new(Some(build_mesh(&full, Vec2::ZERO, Rgb(255, 255, 255), false))));
+        same_pixels(&pixels, &render(&rs, &direct), "ordinary rectangle instances");
+    }
+    assert_eq!(faults.take(), None);
+}
+
 fn list(x: f64, mask: bool) -> DisplayList {
     let points = vec![Vec2::new(x, -80.0), Vec2::new(x + 80.0, -80.0), Vec2::new(x, -180.0)];
     DisplayList {

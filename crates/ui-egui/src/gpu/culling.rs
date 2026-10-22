@@ -2,6 +2,8 @@
 //! return to their original order, including transparent geometry and wipeout boundaries.
 use super::*;
 
+pub(super) mod placements;
+
 #[derive(Clone, Copy)]
 struct Node {
     bounds: [f32; 4],
