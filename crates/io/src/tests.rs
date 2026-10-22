@@ -2373,3 +2373,71 @@ fn foreign_table_reads_cell_text_height_and_keeps_style_scale() {
     assert_eq!(t2.cells[0][0].text_height, Some(150.0));
     assert_eq!(t2.cells[0][1].text_height, None);
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn direct_dwg_matches_compatibility_drawing_across_versions() {
+    // Mixed curves, widths, text, blocks, dimensions, hatches, layouts and third-party XDATA.
+    let mut d = sample();
+    let handle = d.model.iter().next().unwrap().handle;
+    d.model.modify(handle, |entity| {
+        entity.common.xdata = vec![RawTag { code: 1001, value: "THIRD_PARTY".into() }, RawTag { code: 1000, value: "kept café".into() }];
+    });
+    for version in [Version::R2000, Version::R2004, Version::R2007, Version::R2010, Version::R2013, Version::R2018] {
+        let bytes = write_with(&d, "test.dwg", &SaveOptions { version: Some(version), binary: false }).unwrap();
+        let (text, notes) = cadcraft_dwg::dwg_to_dxf_noted(&bytes, cadcraft_dwg::Limits::DEFAULT).unwrap();
+        let mut expected = read_dxf(&text).unwrap();
+        expected.read_notes = notes;
+        let actual = read(&bytes, "test.dwg").unwrap();
+        assert_eq!(actual, expected, "{version:?}");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn direct_dwg_keeps_inactive_layouts_and_drawing_order() {
+    let mut d = sample();
+    d.layouts.push(Layout::new("Electrical", 2));
+    for x in [9.0, 1.0, 7.0] {
+        d.add(&Space::Paper("Electrical".into()), Common::default(), EntityKind::Line(Line { a: Vec3::new(x, 0.0, 0.0), b: Vec3::new(x, 3.0, 0.0) }))
+            .unwrap();
+    }
+    let bytes = write(&d, "test.dwg").unwrap();
+    let expected = read_dxf(&cadcraft_dwg::dwg_to_dxf(&bytes).unwrap()).unwrap();
+    let actual = read(&bytes, "test.dwg").unwrap();
+    assert_eq!(actual, expected);
+    let layout = actual.layout("Electrical").unwrap();
+    let xs: Vec<_> = layout
+        .entities
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EntityKind::Line(l) => Some(l.a.x),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(xs, [9.0, 1.0, 7.0]);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn direct_dwg_needs_no_writable_conversion_directory() {
+    let path = std::env::temp_dir().join(format!("cadcraft-no-conversion-{}", std::process::id()));
+    std::fs::write(&path, b"not a directory").unwrap();
+    crate::set_import_work_dir(path.clone());
+    let mut bytes = write(&sample(), "test.dwg").unwrap();
+    let expected = read(&bytes, "test.dwg").unwrap();
+    bytes.resize(4 << 20, 0);
+    assert_eq!(read(&bytes, "test.dwg").unwrap(), expected);
+    assert_eq!(std::fs::read(&path).unwrap(), b"not a directory");
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn direct_dwg_matches_extension_rich_compatibility_drawing() {
+    let bytes = write(&extension_sample(), "test.dwg").unwrap();
+    let expected = read_dxf(&cadcraft_dwg::dwg_to_dxf(&bytes).unwrap()).unwrap();
+    let actual = read(&bytes, "test.dwg").unwrap();
+    assert_eq!(actual.blocks.keys().collect::<Vec<_>>(), expected.blocks.keys().collect::<Vec<_>>());
+    assert_eq!(actual, expected);
+}

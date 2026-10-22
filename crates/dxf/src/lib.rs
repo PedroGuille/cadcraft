@@ -229,7 +229,7 @@ fn mif_escape_at(chars: &[char], i: usize) -> Option<char> {
 /// page (four hex digits, one UTF-16 code unit; characters above U+FFFF are a surrogate pair of
 /// escapes), and the `\M+nXXXX` sequences for double-byte East Asian characters. Malformed
 /// escapes, unpaired surrogates and unknown `\M+` code pages are kept as literal text.
-fn unescape_unicode(s: &str) -> String {
+pub fn decode_text_escapes(s: &str) -> String {
     if !s.contains("\\U+") && !s.contains("\\M+") {
         return s.to_string();
     }
@@ -281,7 +281,7 @@ fn parse_ascii_with_limit(text: &str, max_tags: usize) -> Result<Vec<Tag>> {
         let Some((_, val)) = lines.next() else { return Err(DxfError::Eof) };
         let v = typed(code, val);
         let v = match v {
-            Value::Str(s) => Value::Str(unescape_unicode(&s)),
+            Value::Str(s) => Value::Str(decode_text_escapes(&s)),
             o => o,
         };
         tags.push(Tag { code, value: v });
@@ -363,7 +363,7 @@ fn parse_binary_with_limit(b: &[u8], max_tags: usize) -> Result<Vec<Tag>> {
             code = i32::from(c.i16()?);
         }
         let v = match kind_of(code) {
-            Kind::Str => Value::Str(unescape_unicode(&text.string(code, c.cstr()?))),
+            Kind::Str => Value::Str(decode_text_escapes(&text.string(code, c.cstr()?))),
             Kind::Real => Value::Real(c.f64()?),
             Kind::Int16 => Value::Int(i64::from(c.i16()?)),
             Kind::Int32 => Value::Int(i64::from(c.i32()?)),

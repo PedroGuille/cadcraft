@@ -1,11 +1,15 @@
-//! DWG support through a DXF bridge.
+//! Native DWG decoding, structured import, and a DXF compatibility bridge.
 //!
 //! DWG files are read with the `acadrust` crate (MPL-2.0, used unmodified as a dependency) and
-//! converted to DXF bytes, which CADCraft's own DXF reader maps to its document model; saving
-//! goes the other way. Keeping the dependency behind this byte-level API isolates it: nothing
-//! else in CADCraft depends on its types. Native targets only (it memory-maps files).
+//! mapped through bounded typed records, without an intermediate DXF file. Saving and legacy
+//! consumers retain the DXF byte bridge. No acadrust types escape this crate.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
+
+#[cfg(not(target_arch = "wasm32"))]
+mod direct;
+#[cfg(not(target_arch = "wasm32"))]
+pub use direct::{DecodedDrawing, Field};
 
 /// DWG version codes we can write.
 pub const VERSIONS: &[(&str, &str)] =
@@ -29,7 +33,7 @@ pub fn version(bytes: &[u8]) -> Option<String> {
 pub struct Limits {
     /// Largest DWG file read at all (checked before reading starts).
     pub max_dwg_bytes: usize,
-    /// Largest DXF rendition of a DWG (checked while it is written).
+    /// Largest DXF rendition or structured decoded payload (checked while it is emitted).
     pub max_dxf_bytes: usize,
 }
 
@@ -272,7 +276,7 @@ mod native {
     /// own merge groups (173, 175, 176), so without this the merges would be lost. Tables whose
     /// cells already carry merges are left alone. Each range's first cell gets the span; the
     /// cells it covers are marked merged with no span of their own, as CADCraft's DXF writer does.
-    fn table_merges(doc: &mut acadrust::CadDocument) {
+    pub(super) fn table_merges(doc: &mut acadrust::CadDocument) {
         for e in doc.entities_mut() {
             let acadrust::entities::EntityType::Table(t) = e else { continue };
             if t.merged_ranges.is_empty() || t.rows.iter().flat_map(|r| &r.cells).any(|c| c.merge_width > 1 || c.merge_height > 1) {
@@ -307,7 +311,7 @@ mod native {
     /// (groups 280, 281). `to_flags` copies the fields into the flags before a DWG is written;
     /// otherwise the flags are copied into the fields after one is read. Older versions store
     /// both and are left alone.
-    fn table_style_rows(doc: &mut acadrust::CadDocument, to_flags: bool) {
+    pub(super) fn table_style_rows(doc: &mut acadrust::CadDocument, to_flags: bool) {
         use acadrust::objects::{ObjectType, TableStyleFlags};
         if doc.version < acadrust::DxfVersion::AC1024 {
             return;
@@ -366,7 +370,7 @@ mod native {
 
     /// Header variables the DWG reader fills in but acadrust's DXF writer (0.6.3) leaves out of
     /// the HEADER section: (name, group code, value).
-    fn unwritten_header_vars(h: &acadrust::document::HeaderVariables) -> [(&'static str, i32, String); 7] {
+    pub(super) fn unwritten_header_vars(h: &acadrust::document::HeaderVariables) -> [(&'static str, i32, String); 7] {
         [
             ("$ANGBASE", 50, h.angle_base.to_string()),
             ("$ANGDIR", 70, h.angle_direction.to_string()),

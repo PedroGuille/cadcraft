@@ -3,7 +3,7 @@
 
 use std::io::{BufRead, Read, Seek, SeekFrom};
 
-use crate::{DxfError, Kind, MAX_TAGS, Result, Tag, Value, codepage, kind_of, typed, unescape_unicode};
+use crate::{DxfError, Kind, MAX_TAGS, Result, Tag, Value, codepage, decode_text_escapes, kind_of, typed};
 
 const MAX_LINE: usize = 8 << 20;
 const HEADER_SCAN: usize = 1 << 20;
@@ -89,7 +89,7 @@ impl<R: BufRead + Seek> AsciiReader<R> {
         }
         let text = codepage::decode(&self.buffer, self.decoder);
         let text = text.trim_end_matches(['\r', '\n']);
-        let value = if kind_of(code) == Kind::Str { Value::Str(unescape_unicode(text)) } else { typed(code, text) };
+        let value = if kind_of(code) == Kind::Str { Value::Str(decode_text_escapes(text)) } else { typed(code, text) };
         self.ended = code == 0 && matches!(&value, Value::Str(s) if s == "EOF");
         Ok(Some(Tag { code, value }))
     }

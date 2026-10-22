@@ -45,7 +45,7 @@ fn format(error: impl std::fmt::Display) -> IoError {
     IoError::Format(error.to_string())
 }
 
-fn append(out: &mut Vec<Tag>, kind: String, body: impl IntoIterator<Item = Tag>) {
+pub(super) fn append(out: &mut Vec<Tag>, kind: String, body: impl IntoIterator<Item = Tag>) {
     if !kind.is_empty() {
         out.push(Tag::s(0, kind));
     }
@@ -54,7 +54,7 @@ fn append(out: &mut Vec<Tag>, kind: String, body: impl IntoIterator<Item = Tag>)
 
 /// Preserve everything raw-data readers use, including subclass boundaries and complete
 /// application groups. Geometry, widths, labels and attribute values are consumed in pass 2.
-fn extras(kind: &str, tags: Vec<Tag>) -> Vec<Tag> {
+pub(super) fn extras(kind: &str, tags: Vec<Tag>) -> Vec<Tag> {
     let needed = kind == "IMAGE" || tags.iter().any(|t| t.code >= 1000 || matches!(t.code, 102 | 347 | 284 | 430));
     if !needed {
         return Vec::new();
@@ -163,7 +163,7 @@ fn load<R: BufRead + Seek>(
     Ok(())
 }
 
-fn flush(
+pub(super) fn flush(
     bundle: &mut Vec<(String, Vec<Tag>)>,
     section: &str,
     block: Option<&str>,
@@ -255,8 +255,8 @@ mod tests {
             cadcraft_dwg::dwg_to_dxf_writer(&bytes, cadcraft_dwg::Limits { max_dxf_bytes: 128, ..cadcraft_dwg::Limits::DEFAULT }, &mut Vec::new())
                 .is_err()
         );
-        // Padding a valid synthetic DWG exercises the public native threshold and disposable
-        // file path without retaining a large binary fixture in the repository.
+        // Both small and large DWGs use the direct record mapper. Padding a synthetic file
+        // checks that file size does not change its drawing data.
         let mut padded = bytes;
         padded.resize(4 << 20, 0);
         assert_eq!(crate::read(&padded, "large.dwg").unwrap(), expected);

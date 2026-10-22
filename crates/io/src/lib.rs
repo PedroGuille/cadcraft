@@ -55,7 +55,7 @@ pub enum IoError {
 
 pub type Result<T> = std::result::Result<T, IoError>;
 
-/// Private temporary storage for streamed DWG imports (Android supplies its writable sandbox).
+/// Remove abandoned conversion files from older app versions. Direct DWG imports use no work files.
 #[cfg(not(target_arch = "wasm32"))]
 pub fn set_import_work_dir(path: std::path::PathBuf) {
     import_work::set_directory(path);
@@ -69,13 +69,12 @@ fn ext(name: &str) -> String {
 /// (SVG and gzip-compressed SVGZ).
 pub fn read(bytes: &[u8], name: &str) -> Result<Drawing> {
     #[cfg(not(target_arch = "wasm32"))]
-    if bytes.len() >= 4 << 20 {
-        if cadcraft_dwg::is_dwg(bytes) {
-            return import_work::read_dwg(bytes);
-        }
-        if !cadcraft_dxf::is_binary(bytes) && matches!(ext(name).as_str(), "dxf" | "") {
-            return dxf_read::streaming::read(std::io::Cursor::new(bytes), &[]);
-        }
+    if cadcraft_dwg::is_dwg(bytes) {
+        return dxf_read::dwg::read(bytes);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if bytes.len() >= 4 << 20 && !cadcraft_dxf::is_binary(bytes) && matches!(ext(name).as_str(), "dxf" | "") {
+        return dxf_read::streaming::read(std::io::Cursor::new(bytes), &[]);
     }
     if cadcraft_dwg::is_dwg(bytes) {
         let (dxf, notes) = cadcraft_dwg::dwg_to_dxf_noted(bytes, cadcraft_dwg::Limits::DEFAULT).map_err(IoError::Format)?;

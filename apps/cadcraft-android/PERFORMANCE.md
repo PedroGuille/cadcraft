@@ -292,3 +292,28 @@ Regression checks cover exact shared rectangle coordinates, neighbour edits/undo
 visibility against linear queries, tile-plan invalidation, sparse GPU copies, cache trimming,
 disk round trips and damaged-cache fallback. Gains in frame time, battery use and reopening
 time still require measurements on an Android tablet with representative drawings.
+
+## Direct structured DWG import (Android 0.1.7)
+
+Native DWG imports now pass typed decoded records to the drawing mapper instead of writing a
+complete temporary DXF and parsing its text back. Coordinates remain numeric throughout this
+transfer. A metadata pass retains symbol tables, object dictionaries, block headers and foreign
+entity properties; a consuming entity pass supplies bounded POLYLINE/INSERT sequences in the
+original block/model/paper order. The existing mapper still resolves OCS, styles, attributes,
+layouts, drawing order and application data. The acadrust dependency remains unmodified and its
+types remain isolated inside the DWG crate.
+
+The consuming pass releases each native entity allocation after mapping it, rather than keeping
+a second complete entity model alongside the new drawing. Structural handle accounting and
+paper-viewport IDs remain consistent across the metadata and entity passes. Failsafe read notes
+and decoded-data/record/handle limits remain enforced, and errors discard the incomplete import.
+The old work-directory hook only cleans abandoned conversion files from earlier app versions;
+opening a DWG no longer requires writable conversion storage. The byte-level DXF bridge remains
+available for compatibility consumers and export.
+
+The decoder still needs the original DWG bytes and its initially decoded database. This is not
+an out-of-core loader and does not guarantee that every large file fits on a tablet. Regression
+checks compare the direct drawing with the compatibility bridge across all six writable DWG
+versions, inactive paper layouts, entity order and third-party XDATA, verify native allocation
+release between entities, and check bounded failures and imports without a writable work folder.
+Opening time, peak process memory and battery use on Android hardware still need measurement.

@@ -9,6 +9,8 @@ use cadcraft_geom::{PolyVertex, Spline, Vec2, Vec3};
 
 use crate::{IoError, Result};
 
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod dwg;
 pub(crate) mod mtext_dxf;
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) mod streaming;
@@ -1817,7 +1819,10 @@ fn read_tags(tags: &[Tag], maximum: Option<Handle>, mut loader: Option<&mut Enti
     }
     if let Some(load) = loader.as_mut() {
         load(&mut d, &mut rx, &paper_block_for, &first_layout, &mut skipped)?;
-        d.blocks.retain(|name, _| !crate::dxf_ext::is_standard_arrow(name) || rx.inserted.contains(&name.to_ascii_uppercase()));
+        d.blocks.retain(|name, _| {
+            let up = name.to_ascii_uppercase();
+            !rx.table_blocks.contains(&up) && (!crate::dxf_ext::is_standard_arrow(name) || rx.inserted.contains(&up))
+        });
         for block in d.blocks.values_mut() {
             let block = std::sync::Arc::make_mut(block);
             block.array = block.array.take().and_then(|mut a| a.sync_names(block.entities.iter().map(|e| e.as_ref())).then_some(a));
