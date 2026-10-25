@@ -21,7 +21,7 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 
 [features]
-desktop-preview = ["dep:eframe", "eframe/default_fonts", "eframe/wgpu", "eframe/x11", "eframe/wayland", "eframe/persistence"]
+desktop-preview = ["dep:eframe", "dep:cadcraft-mcp", "eframe/default_fonts", "eframe/wgpu", "eframe/x11", "eframe/wayland", "eframe/persistence"]
 
 [dependencies]
 cadcraft-engine = { workspace = true }
@@ -42,6 +42,7 @@ jni = "0.21"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 eframe = { workspace = true, optional = true }
+cadcraft-mcp = { workspace = true, optional = true }
 
 [[bin]]
 name = "cadcraft-tablet-preview"

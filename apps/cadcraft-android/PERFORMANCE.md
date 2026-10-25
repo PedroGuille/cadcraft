@@ -1,5 +1,27 @@
 # Tablet rendering and history
 
+## CadCraft 0.13 base (Android 0.13.0)
+
+The tablet branch now merges upstream release `v0.13.0`
+(`1fcf654ea8414ea2ef052ca2b3b77411f2026f78`). Android reports version `0.13.0`
+(version code `13000`), retaining the existing application ID and signing certificate.
+The tablet toolbar, native document providers, recovery, pen hover, finger navigation,
+double-tap cancellation, adaptive caches and 20-step undo remain available.
+
+Upstream's selection cycling, PICKDRAG setting, cursor contrast/menu behavior, unit handling,
+file-format fixes, PDF writer and updated dependencies are integrated with the tablet paths.
+Both streamed DXF and direct DWG mapping share the document-wide table-cell budget; streamed
+imports retain redefined standard-name arrow blocks just as ordinary imports do.
+Typed DWG imports also share upstream's current-style name restoration and orphaned DGN
+component cleanup with the compatibility readers, including their read diagnostics.
+
+Packaging preserves the exact unstripped native library in `dist/android/symbols/<abi>/`
+before stripping the APK's copy. The libraries carry a linker build ID, and the retained
+line tables allow native addresses to be traced to the matching source build. Keep these
+symbols with each distributed APK. An upstream version upgrade alone does not establish a
+fix for an earlier out-of-memory abort; opening time, peak memory and pen responsiveness
+still require checks on the target tablet.
+
 Navigation retains the same text, hatch, gradient and curve geometry detail as the stationary
 view, with no navigation-specific substitutions or coarser chord tolerance. Screen geometry
 still replaces subpixel thin curves with point markers. The drawing database, engine snapping

@@ -238,10 +238,10 @@ pub fn prompt(app: &mut CadApp, ctx: &egui::Context) {
     let mut choice = None;
     egui::Modal::new(egui::Id::new("cc_close_prompt")).show(ctx, |ui| {
         ui.set_width(360.0);
-        ui.label(RichText::new("CADCraft").strong());
+        ui.label(RichText::new(crate::tl!("CADCraft")).strong());
         ui.add_space(4.0);
-        ui.label(format!("Save changes to {title}?"));
-        ui.label(RichText::new("Your changes will be lost if you don't save them.").color(t.text_dim));
+        ui.label(crate::tf!("Save changes to {name}?", name = title));
+        ui.label(RichText::new(crate::tl!("Your changes will be lost if you don't save them.")).color(t.text_dim));
         if app.closing.as_ref().is_some_and(|c| c.saving.is_some()) {
             ui.spinner();
             ui.label(crate::i18n::t("Saving…"));
@@ -249,14 +249,14 @@ pub fn prompt(app: &mut CadApp, ctx: &egui::Context) {
         ui.add_space(10.0);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let size = vec2(84.0, if app.tablet_mode { app.tablet_prefs.height() } else { 22.0 });
-            let save = ui.add(egui::Button::new(RichText::new("Save").color(t.text)).fill(t.accent).min_size(size));
+            let save = ui.add(egui::Button::new(RichText::new(crate::tl!("Save")).color(t.text)).fill(t.accent).min_size(size));
             if save.clicked() {
                 choice = Some(Choice::Save);
             }
-            if ui.add(egui::Button::new("Cancel").min_size(size)).clicked() {
+            if ui.add(egui::Button::new(crate::tl!("Cancel")).min_size(size)).clicked() {
                 choice = Some(Choice::Cancel);
             }
-            if ui.add(egui::Button::new("Don't Save").min_size(size)).clicked() {
+            if ui.add(egui::Button::new(crate::tl!("Don't Save")).min_size(size)).clicked() {
                 choice = Some(Choice::Discard);
             }
         });

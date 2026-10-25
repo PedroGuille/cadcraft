@@ -226,9 +226,9 @@ impl SpatialIndex {
         let pad = (b.width() + b.height()) * 1e-9 + (b.min.x.abs() + b.min.y.abs() + b.max.x.abs() + b.max.y.abs()) * 1e-12 + 1e-300;
         let env = AABB::from_corners([b.min.x - pad, b.min.y - pad], [b.max.x + pad, b.max.y + pad]);
         let mut out = self.unbounded.clone();
-        for item in self.tree.locate_in_envelope_intersecting(&env) {
+        for item in self.tree.locate_in_envelope_intersecting(env) {
             if let Some((off, chunk)) = self.chunks.get(item.data) {
-                out.extend(chunk.tree.locate_in_envelope_intersecting(&env).map(|it| off + it.data));
+                out.extend(chunk.tree.locate_in_envelope_intersecting(env).map(|it| off + it.data));
             }
         }
         if with_infinite {

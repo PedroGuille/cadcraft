@@ -76,6 +76,10 @@ pub(super) fn extras(kind: &str, tags: Vec<Tag>) -> Vec<Tag> {
 }
 
 pub(crate) fn read<R: BufRead + Seek>(input: R, overrides: &[(&str, i32, String)]) -> Result<Drawing> {
+    read_budgeted(input, overrides, 4_000_000)
+}
+
+fn read_budgeted<R: BufRead + Seek>(input: R, overrides: &[(&str, i32, String)], table_cells_left: usize) -> Result<Drawing> {
     let mut records = Records { tags: cadcraft_dxf::AsciiReader::new(input).map_err(format)?, pending: None };
     let mut metadata = Vec::new();
     let mut section = String::new();
@@ -110,7 +114,12 @@ pub(crate) fn read<R: BufRead + Seek>(input: R, overrides: &[(&str, i32, String)
     }
     records.tags.rewind().map_err(format)?;
     records.pending = None;
-    super::read_tags(&metadata, maximum, Some(&mut |d, rx, paper, first, skipped| load(&mut records, d, rx, paper, first, skipped)))
+    super::read_tags_budgeted(
+        &metadata,
+        maximum,
+        Some(&mut |d, rx, paper, first, skipped| load(&mut records, d, rx, paper, first, skipped)),
+        table_cells_left,
+    )
 }
 
 fn load<R: BufRead + Seek>(
@@ -216,6 +225,38 @@ pub(super) fn flush(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn streamed_tables_share_the_v013_cell_limit_across_blocks_and_sections() {
+        let table = |handle| format!("0\nACAD_TABLE\n5\n{handle}\n100\nAcDbEntity\n8\n0\n100\nAcDbBlockReference\n100\nAcDbTable\n91\n2\n92\n2\n");
+        let bytes = format!(
+            "0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\nSYMBOL\n10\n0\n20\n0\n{}0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n{}0\nENDSEC\n0\nEOF\n",
+            table("20"),
+            table("21")
+        );
+        let expected = super::super::read_budgeted(bytes.as_bytes(), 4).unwrap();
+        let actual = read_budgeted(Cursor::new(bytes.as_bytes()), &[], 4).unwrap();
+        assert_eq!(actual, expected);
+        let cells = actual
+            .model
+            .iter()
+            .chain(actual.blocks.values().flat_map(|b| b.entities.iter()))
+            .filter_map(|e| match &e.kind {
+                EntityKind::Table(t) => Some(t.cells.iter().map(Vec::len).sum::<usize>()),
+                _ => None,
+            })
+            .sum::<usize>();
+        assert_eq!(cells, 4, "the second pass must share the import's remaining allowance");
+    }
+
+    #[test]
+    fn streamed_import_keeps_a_redefined_standard_arrow_block() {
+        let bytes = b"0\nSECTION\n2\nBLOCKS\n0\nBLOCK\n2\n_DOT\n10\n0\n20\n0\n0\nLINE\n5\n20\n8\n0\n10\n1\n20\n2\n11\n3\n21\n4\n0\nENDBLK\n0\nENDSEC\n0\nSECTION\n2\nENTITIES\n0\nENDSEC\n0\nEOF\n";
+        let expected = super::super::read(bytes).unwrap();
+        let actual = read(Cursor::new(bytes), &[]).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(actual.blocks.get("_DOT").unwrap().entities.len(), 1);
+    }
 
     #[test]
     fn native_stream_preserves_complete_drawing_and_foreign_data() {

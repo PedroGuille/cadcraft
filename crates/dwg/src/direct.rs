@@ -54,10 +54,9 @@ impl DecodedDrawing {
                     .unwrap_or("the file's objects couldn't be read");
                 return Err(format!("DWG: {why}"));
             }
-            let notes = super::native::read_notes(&outcome.stats);
+            let mut notes = super::native::read_notes(&outcome.stats);
             let mut document = outcome.document;
-            super::native::table_merges(&mut document);
-            super::native::table_style_rows(&mut document, false);
+            super::native::prepare_read(&mut document, &mut notes);
             let (start, seed) = handles(&document)?;
             Ok(Self { document, notes, limits, start, seed })
         })

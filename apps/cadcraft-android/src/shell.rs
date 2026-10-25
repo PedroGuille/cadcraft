@@ -157,6 +157,7 @@ impl Shell {
                 None
             })),
             pick_save: Some(Box::new(move |name| save_path(&save_dir, name))),
+            ..Services::default()
         };
         let mut cad = CadApp::new(Session::empty(), services);
         #[cfg(target_os = "android")]

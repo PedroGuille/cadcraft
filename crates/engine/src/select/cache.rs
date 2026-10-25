@@ -130,5 +130,5 @@ pub(super) fn distance(d: &Drawing, e: &Entity, p: Vec2, tolerance: f64) -> Opti
             geometry
         }
     };
-    Some(geometry.edges.nearest_neighbor(&[p.x, p.y]).map_or(f64::INFINITY, |edge| Line::new(edge.a, edge.b).dist(p)))
+    Some(geometry.edges.nearest_neighbor([p.x, p.y]).map_or(f64::INFINITY, |edge| Line::new(edge.a, edge.b).dist(p)))
 }

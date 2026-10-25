@@ -23,9 +23,9 @@ patched = stage / "winit-hover"
 workspace = stage / "workspace"
 old_module = patched / "src/platform_impl/android/mod.rs"
 previous = (old_module.read_bytes(), old_module.stat().st_atime_ns, old_module.stat().st_mtime_ns) if old_module.is_file() else None
-if patched.exists():
-    shutil.rmtree(patched)
-shutil.copytree(source, patched)
+# Refresh the same pinned crate in place; interrupted packaging can leave a partial tree.
+# Its version is checked above, so there are no files from another winit release to retain.
+shutil.copytree(source, patched, dirs_exist_ok=True)
 module = patched / "src/platform_impl/android/mod.rs"
 text = module.read_text()
 marker = "                let phase = match motion_event.action() {"

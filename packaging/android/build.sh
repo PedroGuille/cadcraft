@@ -32,6 +32,12 @@ workspace="$(python3 packaging/android/prepare_winit.py "$stage")"
     cd "$workspace"
     cargo ndk --platform 26 --target "$abi" --output-dir "$stage/lib" build --locked --lib -p cadcraft-android --profile android
 )
+# Preserve symbols from the exact linked library before stripping the installed copy.
+# Keep them with this APK so native crash offsets can be resolved after a workspace expires.
+symbols="$output/symbols/$abi"
+mkdir -p "$symbols"
+cp "$stage/lib/$abi/libcadcraft_android.so" "$symbols/libcadcraft_android.so"
+"$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip" --strip-unneeded "$stage/lib/$abi/libcadcraft_android.so"
 java --module jdk.compiler/com.sun.tools.javac.Main --release 8 -classpath "$android_jar" -d "$stage/classes" \
     packaging/android/java/io/github/storytold/cadcraft/*.java
 mapfile -t classes < <(find "$stage/classes" -name '*.class' -print)
